@@ -30,36 +30,64 @@ subprojects {
         testAnnotationProcessor 'org.projectlombok:lombok:1.18.36'
     }
 
+    // Default `test` task runs unit + slice tests only — Testcontainers-backed
+    // classes carry `@Tag("integration")` (either directly or via the
+    // `AbstractIntegrationTest` base in `libs/java-test-support`) and are
+    // excluded so the root CI `:check` stays Docker-free. The dedicated
+    // `:integrationTest` task below opts back in for environments that have
+    // Docker available (CI iam-integration-tests job, local developer runs).
     test {
-        useJUnitPlatform()
+        useJUnitPlatform {
+            excludeTags 'integration'
+        }
         jvmArgs '-XX:+EnableDynamicAgentLoading'
-    }
 
-    // Forward Docker / Testcontainers env into every Test task (test, integrationTest,
-    // e2eTest, etc.). docker-java's default API version (1.32) is rejected by modern
-    // dockerd implementations — Rancher Desktop's dockerd requires minimum API 1.41,
-    // and Docker Desktop 4.36+ has a CLI proxy that intercepts docker-java probes.
-    // DOCKER_API_VERSION + system property 'api.version' force docker-java to skip
-    // the stale default. DOCKER_HOST forwarding handles Windows named-pipe / WSL2
-    // socket override scenarios.
-    // Defensive future-proof — when `-Xlint:all` or `-Xlint:serial` is ever
-    // enabled (currently neither is set), silently skip the cosmetic `[serial]`
-    // warning category. This codebase uses exceptions only for control flow
-    // (Spring `@RestControllerAdvice` converts to JSON ErrorResponse before
-    // serialization), so the missing `serialVersionUID` warnings on ~200
-    // exception classes are pure noise. Per TASK-MONO-131.
-    tasks.withType(JavaCompile).configureEach {
-        options.compilerArgs.add('-Xlint:-serial')
-    }
-
-    tasks.withType(Test).configureEach {
+        // Forward Testcontainers-relevant env/system props into the forked test JVM.
+        // On Windows + Docker Desktop, named-pipe auto-detection can fail; developers
+        // set DOCKER_HOST=tcp://localhost:2375 (requires the "Expose daemon on tcp"
+        // option). See docs/guides/local-integration-testing.md.
         def dockerHost = System.getenv('DOCKER_HOST') ?: System.getProperty('docker.host')
         if (dockerHost) {
             environment 'DOCKER_HOST', dockerHost
             systemProperty 'docker.host', dockerHost
         }
-        def apiVersion = System.getenv('DOCKER_API_VERSION') ?: '1.45'
-        environment 'DOCKER_API_VERSION', apiVersion
-        systemProperty 'api.version', apiVersion
+    }
+
+    // Opt-in task for `@Tag("integration")` tests. Requires Docker.
+    // Runs the same source set as `test` (no separate compile / classpath) and
+    // raises the per-test timeout because Spring context boot + container
+    // startup can exceed the default.
+    tasks.register('integrationTest', Test) {
+        description = 'Runs only @Tag("integration") tests (Testcontainers required).'
+        group = 'verification'
+        useJUnitPlatform {
+            includeTags 'integration'
+        }
+        testClassesDirs = sourceSets.test.output.classesDirs
+        classpath = sourceSets.test.runtimeClasspath
+        jvmArgs '-XX:+EnableDynamicAgentLoading'
+        systemProperty 'junit.jupiter.execution.timeout.default', '5m'
+
+        testLogging {
+            events 'passed', 'failed', 'skipped'
+            exceptionFormat 'full'
+            showStandardStreams = true
+        }
+
+        def dockerHost = System.getenv('DOCKER_HOST') ?: System.getProperty('docker.host')
+        if (dockerHost) {
+            environment 'DOCKER_HOST', dockerHost
+            systemProperty 'docker.host', dockerHost
+        }
+
+        // Surface System.out / System.err from inside tests in the CI log so
+        // that diagnostic prints (e.g. `[046-7][cluster-a]` body / stack traces)
+        // are visible without per-test slf4j adapter setup. Same pattern as
+        // scm-platform tests/e2e/build.gradle (TASK-SCM-INT-001).
+        testLogging {
+            events 'passed', 'failed', 'skipped'
+            exceptionFormat 'full'
+            showStandardStreams = true
+        }
     }
 }

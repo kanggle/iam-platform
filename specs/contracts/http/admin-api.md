@@ -1,0 +1,1545 @@
+# HTTP Contract: admin-service (Public API — Operator Only)
+
+운영자 전용. 게이트웨이에서 `/api/admin/*` 경로에 **별도 인증 필터 체인** 적용. 일반 사용자 JWT로는 접근 불가.
+
+base path: `/api/admin`
+
+모든 요청에 필수: `X-Operator-Reason` 헤더 (감사 사유)
+
+> **인코딩 (TASK-MONO-176)**: `X-Operator-Reason` 값은 **percent-encoded (UTF-8, `encodeURIComponent`)** 로 전송된다. HTTP 헤더 값은 ByteString(ISO-8859-1)이라 한글 등 비-Latin-1 사유를 RAW 로 실으면 클라이언트 `fetch()` 가 전송 전 throw 한다. 서비스는 수신 시 percent-decode(UTF-8) 하여 원문 사유를 `admin_actions.reason` 에 저장한다(percent-escape 없는 ASCII 값은 그대로 round-trip). 디코드는 모든 `/api/admin/**` 컨트롤러에 대해 단일 필터(`OperatorReasonDecodingFilter`)에서 수행된다.
+
+---
+
+## Authentication
+
+모든 `/api/admin/*` 경로는 기본적으로 **operator JWT 필수**이다:
+
+- `Authorization: Bearer <operator-token>` 필수 (`token_type = "admin"`, `iss = "admin-service"`)
+- 토큰 발급·서명·검증은 admin-service 자체 IdP가 소유 ([specs/services/admin-service/architecture.md](../../services/admin-service/architecture.md) Admin IdP Boundary 참조)
+- `X-Operator-Reason` 헤더 필수 (감사 사유)
+
+### Exceptions (no operator JWT required)
+
+아래 서브트리는 위 기본 규칙의 **예외**로, 정식 operator JWT 없이도 호출 가능하다. `OperatorAuthenticationFilter.shouldNotFilter`의 완화 범위는 **정확히 이 경로들로 한정**된다.
+
+| Method | Path | 대체 인증 | X-Operator-Reason |
+|---|---|---|---|
+| `POST` | `/api/admin/auth/login` | 없음 (username + password + 선택적 TOTP 코드 body) | 요구 없음 |
+| `POST` | `/api/admin/auth/token-exchange` | **GAP OIDC `platform-console-web` subject token 필수** (RFC 8693 body) | 요구 없음 |
+| `POST` | `/api/admin/auth/2fa/enroll` | **bootstrap token 필수** | 요구 없음 |
+| `POST` | `/api/admin/auth/2fa/verify` | **bootstrap token 필수** | 요구 없음 |
+| `POST` | `/api/admin/auth/refresh` | 없음 (refresh JWT body) | 요구 없음 |
+| `GET` | `/.well-known/admin/jwks.json` | 없음 (public key 노출) | 요구 없음 |
+
+> **`/api/admin/auth/token-exchange` (TASK-BE-298 / ADR-MONO-014)**: 이 경로는
+> 정식 operator JWT 없이 호출 가능한 **추가 operator-token 발급 경로**다. 정식
+> operator JWT 대신 GAP OIDC `platform-console-web` access token(subject token)을
+> body 로 제시한다 — 이는 `/api/admin/auth/login` 의 "요청자 본인 인증 플로우"
+> 예외와 동일 성격(다른 대상에 대한 운영 명령이 아님). admin-service 는 이
+> subject token 을 auth-service JWKS 로 검증한 뒤 OIDC subject 를
+> `admin_operators` row 로 fail-closed 해석하고 **기존 login-success 발급기와
+> 동일한 operator access token**(`token_type=admin`, `iss=admin-service`)을
+> 민팅한다. `OperatorAuthenticationFilter` 는 **확장되지 않는다** — 2번째
+> issuer 를 수용하지 않으며(ADR-MONO-014 D1 Option A 기각), exchange 는
+> password+TOTP login mint 의 **형제 발급 경로**일 뿐이다 (자세한 검증 정책:
+> [security.md §GAP OIDC Subject-Token Validation](../../services/admin-service/security.md)).
+
+위 경로 외의 어떤 `/api/admin/*` 요청도 operator JWT + `X-Operator-Reason`이 없으면 401/400으로 거부된다.
+
+#### Bootstrap Token (2FA sub-tree)
+
+`/api/admin/auth/2fa/enroll` 및 `/api/admin/auth/2fa/verify`는 정식 operator JWT 대신 **bootstrap token**(`token_type = "admin_bootstrap"`, TTL 10분, scope = `["2fa_enroll", "2fa_verify"]`, `jti` 1회 소비)을 요구한다. bootstrap token은 `POST /api/admin/auth/login`이 password verify 성공 + 2FA 미완료 상태일 때 응답 body로 발급한다. 상세 규약은 [specs/services/admin-service/security.md](../../services/admin-service/security.md) "Bootstrap Token" 섹션 참조. 구현은 TASK-BE-029.
+
+#### X-Operator-Reason in Exceptions sub-tree
+
+본 서브트리의 요청은 "다른 대상에 대한 운영 명령"이 아니라 **요청자 본인의 인증 플로우**이므로 `X-Operator-Reason` 헤더를 요구하지 않는다. `admin_actions` 기록이 발생하는 경우(예: enroll/verify)는 reason 필드에 상수 `"<self_enrollment>"`로 기록한다.
+
+**Self-serve `me/*` mutation 경로의 동일 면제 (TASK-BE-306)**: 위 sub-tree 외에도, 운영자가 **자기 자신의 프로파일/자격증명을 변경**하는 self-serve `me/*` mutation 경로는 동일한 self-flow 면제를 따른다 — operator JWT 는 필수이지만 `X-Operator-Reason` 은 요구하지 않으며, `admin_actions` row 의 reason 필드에 self-flow 상수를 기록한다. 현재 해당 경로:
+
+| Method | Path | reason 상수 | 비고 |
+|---|---|---|---|
+| `PATCH` | `/api/admin/operators/me/password` | `<self_password_change>` | TASK-BE-013 |
+| `PATCH` | `/api/admin/operators/me/profile` | `<self_profile_update>` | **신규 (TASK-BE-306)** — operator 프로파일 carrier (`operatorContext.defaultAccountId` 등) 자가 설정 |
+
+
+---
+
+## Authorization Model
+
+모든 mutation 및 read endpoint는 필요한 **permission key**를 선언한다 ([specs/services/admin-service/rbac.md](../../services/admin-service/rbac.md)). 운영자의 role 집합이 보유한 permission 합집합에 요청 endpoint의 permission이 포함되어야 통과한다. 누락 시 `403 PERMISSION_DENIED`.
+
+- Permission key catalog: `account.read`, `account.lock`, `account.unlock`, `account.force_logout`, `audit.read`, `security.event.read`
+- Annotation이 선언되지 않은 endpoint는 **fail-closed로 deny**되며 `admin_actions`에 `outcome=DENIED, permission_used="<missing>"` 기록
+- 권한 거부는 request 단위로 감사 row 1건 기록 (dedup 없음)
+- Operator 식별자는 JWT `sub` 클레임에서 추출 (`token_type = "admin"` 필수)
+
+---
+
+## GET /api/admin/accounts
+
+계정 검색. 이메일이 있으면 이메일로 단건 검색하고, 없으면 `account.read` 권한 보유 시 전체 계정 목록을 페이지네이션으로 반환한다.
+
+**Auth required**: Yes (operator token, `token_type=admin`)
+**Required permission**: `account.read`
+**Granted to roles**: `SUPER_ADMIN`, `SUPPORT_READONLY`
+
+**Query Parameters**:
+
+| 파라미터 | 타입 | 설명 |
+|---|---|---|
+| `email` | string (optional) | 이메일로 단건 검색. 없으면 전체 목록 반환 |
+| `page` | int (default 0) | 전체 목록 조회 시 페이지 번호 |
+| `size` | int (default 20, max 100) | 전체 목록 조회 시 페이지 크기 |
+
+**동작 규칙**:
+- `email` 파라미터 있음 → 이메일로 단건 검색. `account.read` 권한 불필요 (기존 동작 유지).
+- `email` 파라미터 없음 + `account.read` 권한 보유 → 전체 계정 목록 페이지네이션 반환.
+- `email` 파라미터 없음 + `account.read` 권한 미보유 → 빈 목록 반환 (403 아님).
+- `size` > 100 → 400 `VALIDATION_ERROR`.
+
+**Response 200** (email 없음, account.read 보유):
+```json
+{
+  "content": [
+    {
+      "id": "string",
+      "email": "string",
+      "status": "ACTIVE",
+      "createdAt": "2026-01-01T00:00:00Z"
+    }
+  ],
+  "totalElements": 150,
+  "page": 0,
+  "size": 20,
+  "totalPages": 8
+}
+```
+
+**Response 200** (email 있음 또는 account.read 미보유):
+```json
+{
+  "content": [],
+  "totalElements": 0,
+  "page": 0,
+  "size": 20,
+  "totalPages": 0
+}
+```
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 401 | `TOKEN_INVALID` | operator token 만료/변조 |
+| 400 | `VALIDATION_ERROR` | size > 100 |
+| 503 | `DOWNSTREAM_ERROR` | account-service 호출 실패 |
+| 503 | `CIRCUIT_OPEN` | account-service circuit breaker OPEN |
+
+---
+
+## POST /api/admin/accounts/{accountId}/lock
+
+계정 강제 잠금.
+
+**Auth required**: Yes (operator token, `token_type=admin`)
+**Required permission**: `account.lock`
+**Granted to roles**: `SUPER_ADMIN`, `SUPPORT_LOCK`
+
+**Headers**:
+- `Authorization: Bearer <operator-token>`
+- `X-Operator-Reason: string (required, 감사 사유)`
+- `Idempotency-Key: string (required)`
+
+**Request**:
+```json
+{
+  "reason": "string (required, 상세 사유)",
+  "ticketId": "string (optional, 내부 티켓 번호)"
+}
+```
+
+**Response 200**:
+```json
+{
+  "accountId": "string",
+  "previousStatus": "ACTIVE",
+  "currentStatus": "LOCKED",
+  "operatorId": "string",
+  "lockedAt": "2026-04-12T10:00:00Z",
+  "auditId": "string (admin_actions.id)"
+}
+```
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 401 | `TOKEN_INVALID` | operator token 만료/변조 |
+| 403 | `PERMISSION_DENIED` | role 부족 |
+| 400 | `STATE_TRANSITION_INVALID` | 이미 LOCKED 또는 DELETED 상태 |
+| 400 | `REASON_REQUIRED` | X-Operator-Reason 또는 body reason 누락 |
+| 404 | `ACCOUNT_NOT_FOUND` | 대상 계정 미존재 |
+| 503 | `DOWNSTREAM_ERROR` | account-service 호출 실패 (5xx/timeout) |
+| 503 | `CIRCUIT_OPEN` | account-service circuit breaker OPEN (호출 자체 거부) |
+
+**Side Effects**: admin_actions 감사 기록 + `admin.action.performed` 이벤트 + account-service에 내부 HTTP lock 명령. `503 DOWNSTREAM_ERROR`/`503 CIRCUIT_OPEN` 시에도 `admin_actions`에 `outcome=FAILURE` 행이 기록된다 (A10 fail-closed).
+
+---
+
+## POST /api/admin/accounts/bulk-lock
+
+여러 계정을 한 번의 요청으로 순차 잠금. 보안 사고 대응 시 사용.
+
+**Auth required**: Yes (operator token, `token_type=admin`)
+**Required permission**: `account.lock`
+**Granted to roles**: `SUPER_ADMIN`, `SUPPORT_LOCK`
+
+**Headers**:
+- `Authorization: Bearer <operator-token>`
+- `X-Operator-Reason: string (required)` — 감사 헤더
+- `Idempotency-Key: string (required, ≤64자, UUID 권장)`
+
+**Request**:
+```json
+{
+  "accountIds": ["acc-1", "acc-2", "..."],
+  "reason": "string (required, ≥8자)",
+  "ticketId": "string (optional)"
+}
+```
+
+**Constraints**:
+- `accountIds.length` ≤ 100. 초과 시 `422 BATCH_SIZE_EXCEEDED`.
+- 중복 `accountId`는 서버에서 1회만 처리 (입력 순서 보존 dedup).
+- `reason`은 최소 8자.
+
+**Response 200**:
+```json
+{
+  "results": [
+    { "accountId": "acc-1", "outcome": "LOCKED" },
+    { "accountId": "acc-2", "outcome": "NOT_FOUND",      "error": { "code": "ACCOUNT_NOT_FOUND", "message": "..." } },
+    { "accountId": "acc-3", "outcome": "ALREADY_LOCKED", "error": { "code": "STATE_TRANSITION_INVALID", "message": "..." } },
+    { "accountId": "acc-4", "outcome": "FAILURE",        "error": { "code": "DOWNSTREAM_ERROR", "message": "..." } }
+  ]
+}
+```
+
+- `outcome` ∈ `{LOCKED, NOT_FOUND, ALREADY_LOCKED, FAILURE}`
+- 부분 실패 허용: 일부 계정 실패 시에도 응답은 200. 전체 롤백 없음.
+- 각 타겟 계정별로 `admin_actions` 1행 기록 (NOT_FOUND/FAILURE 포함).
+
+**Idempotency**:
+- `(operator_id, Idempotency-Key)`가 유일 키.
+- 동일 key로 재요청 시 body(SHA-256 기준 canonical hash = sorted dedup accountIds + reason + ticketId) 일치하면 **이전 응답 본문을 그대로 반환**하며 추가 다운스트림 호출·감사 row 기록 없음.
+- 동일 key + 다른 payload 시 `409 IDEMPOTENCY_KEY_CONFLICT`.
+- 저장 TTL 정책은 운영 정책(out-of-scope). 별도 cleanup 작업이 책임.
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 401 | `TOKEN_INVALID` | operator token 만료/변조 |
+| 403 | `PERMISSION_DENIED` | `account.lock` 미보유 |
+| 400 | `REASON_REQUIRED` | `X-Operator-Reason` 누락 |
+| 400 | `VALIDATION_ERROR` | 필수 헤더/필드 누락, reason<8자, accountIds 비어있음 |
+| 422 | `BATCH_SIZE_EXCEEDED` | accountIds>100 |
+| 409 | `IDEMPOTENCY_KEY_CONFLICT` | 동일 key 재사용·payload 불일치 |
+| 503 | `CIRCUIT_OPEN` | 전체 요청이 circuit open으로 소화되지 않은 드문 경우 (개별 row 레벨 CB OPEN은 outcome=FAILURE로 기록) |
+
+**Side Effects**: accountId별 `admin_actions` 1행, `admin.action.performed` outbox 이벤트 N건, `admin_bulk_lock_idempotency` 1행.
+
+---
+
+## POST /api/admin/accounts/{accountId}/unlock
+
+계정 잠금 해제.
+
+**Auth required**: Yes (operator token, `token_type=admin`)
+**Required permission**: `account.unlock`
+**Granted to roles**: `SUPER_ADMIN`, `SUPPORT_LOCK`
+
+**Headers**: Authorization + X-Operator-Reason + Idempotency-Key
+
+**Request**:
+```json
+{
+  "reason": "string (required)",
+  "ticketId": "string (optional)"
+}
+```
+
+**Response 200**:
+```json
+{
+  "accountId": "string",
+  "previousStatus": "LOCKED",
+  "currentStatus": "ACTIVE",
+  "operatorId": "string",
+  "unlockedAt": "2026-04-12T10:00:00Z",
+  "auditId": "string"
+}
+```
+
+**Errors**: lock과 동일 구조 (503 `DOWNSTREAM_ERROR` + 503 `CIRCUIT_OPEN` 포함). `STATE_TRANSITION_INVALID`는 LOCKED가 아닌 상태에서 unlock 시도 시.
+
+---
+
+## POST /api/admin/sessions/{accountId}/revoke
+
+특정 계정의 모든 세션 강제 종료 (refresh token 전체 revoke).
+
+**Auth required**: Yes (operator token, `token_type=admin`)
+**Required permission**: `account.force_logout`
+**Granted to roles**: `SUPER_ADMIN`, `SUPPORT_LOCK`, `SECURITY_ANALYST`
+
+**Headers**: Authorization + X-Operator-Reason + Idempotency-Key
+
+**Request**:
+```json
+{
+  "reason": "string (required)"
+}
+```
+
+**Response 200**:
+```json
+{
+  "accountId": "string",
+  "revokedSessionCount": 3,
+  "operatorId": "string",
+  "revokedAt": "2026-04-12T10:00:00Z",
+  "auditId": "string"
+}
+```
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 401 | `TOKEN_INVALID` | — |
+| 403 | `PERMISSION_DENIED` | — |
+| 404 | `ACCOUNT_NOT_FOUND` | — |
+| 503 | `DOWNSTREAM_ERROR` | auth-service 호출 실패 (5xx/timeout) |
+| 503 | `CIRCUIT_OPEN` | auth-service circuit breaker OPEN (호출 자체 거부) |
+
+**Side Effects**: auth-service에 내부 HTTP force-logout 명령 + admin_actions 기록. `503 DOWNSTREAM_ERROR`/`503 CIRCUIT_OPEN` 시에도 `admin_actions`에 `outcome=FAILURE` 행이 기록된다 (A10 fail-closed).
+
+---
+
+## GET /api/admin/audit
+
+감사 로그 조회 (통합 뷰: admin_actions + login_history + suspicious_events).
+
+**Auth required**: Yes (operator token, `token_type=admin`)
+**Required permission**: `audit.read` (기본). `source=login_history` 또는 `source=suspicious` 필터 사용 시 `security.event.read`도 **추가로** 요구 (union이 아닌 intersection 검증 — 두 권한 모두 필요)
+**Granted to roles**:
+- `audit.read` only: `SUPPORT_LOCK` (admin_actions만 조회 가능, security source 필터 사용 시 403)
+- `audit.read` + `security.event.read`: `SUPER_ADMIN`, `SUPPORT_READONLY`, `SECURITY_ANALYST` (모든 source 조회 가능)
+
+**Query Parameters**:
+
+| 파라미터 | 타입 | 설명 |
+|---|---|---|
+| `accountId` | string (optional) | 특정 계정 필터 |
+| `actionCode` | string (optional) | ACCOUNT_LOCK, SESSION_REVOKE 등 |
+| `from` | ISO 8601 datetime | 시작 시각 |
+| `to` | ISO 8601 datetime | 종료 시각 |
+| `source` | string (optional) | `admin` / `login_history` / `suspicious` |
+| `tenantId` | string (optional) | **TASK-BE-249** — 조회할 테넌트. 생략 시 운영자 자신의 테넌트. `*`는 SUPER_ADMIN 전용 (크로스 테넌트). 일반 운영자가 자신의 테넌트가 아닌 값을 지정하면 `403 TENANT_SCOPE_DENIED`. |
+| `page` | int (default 0) | — |
+| `size` | int (default 20, max 100) | — |
+
+**Response 200**:
+```json
+{
+  "content": [
+    {
+      "source": "admin",
+      "auditId": "string",
+      "actionCode": "ACCOUNT_LOCK",
+      "operatorId": "string",
+      "targetId": "string",
+      "reason": "string",
+      "outcome": "SUCCESS",
+      "occurredAt": "2026-04-12T10:00:00Z"
+    },
+    {
+      "source": "login_history",
+      "eventId": "string",
+      "accountId": "string",
+      "outcome": "FAILURE",
+      "ipMasked": "192.168.*.*",
+      "geoCountry": "KR",
+      "occurredAt": "2026-04-12T09:58:00Z"
+    }
+  ],
+  "page": 0,
+  "size": 20,
+  "totalElements": 150,
+  "totalPages": 8
+}
+```
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 401 | `TOKEN_INVALID` | — |
+| 403 | `PERMISSION_DENIED` | `audit.read` 또는 source별 추가 권한(`security.event.read`) 부족 |
+| 403 | `TENANT_SCOPE_DENIED` | **TASK-BE-249** — 일반 운영자가 자신의 테넌트가 아닌 `tenantId`를 지정한 경우 |
+| 422 | `VALIDATION_ERROR` | from > to, size > 100 등 |
+
+**Side Effects** (TASK-BE-262): `403 TENANT_SCOPE_DENIED` 응답 시 `admin_actions` 테이블에 `outcome=DENIED`, `tenant_id=operator's`, `target_tenant_id=operator's`, `downstream_detail`에 시도한 대상 테넌트 기록 — best-effort 쓰기. 실패해도 403 자체는 정상 반환되며 `admin.audit.cross_tenant_deny_failure` 메트릭이 증가한다.
+
+**Note**: 이 조회 자체가 **meta-audit**로 기록됨 ([rules/traits/audit-heavy.md](../../../../../rules/traits/audit-heavy.md) A5). PII는 마스킹됨 (IP 일부, 이메일 미포함).
+
+---
+
+## POST /api/admin/auth/login
+
+운영자 자체 로그인. Argon2id 패스워드 검증 + (role 중 `require_2fa=TRUE`가 있으면) TOTP 또는 recovery code 검증 후 operator JWT를 발급한다.
+
+**Auth required**: 없음 (body 기반 인증)
+**Required permission**: 없음 (self-login)
+**X-Operator-Reason**: 요구 없음 (`admin_actions.reason = "<self_login>"` 상수 기록)
+
+**Headers**: 없음
+
+**Request**:
+```json
+{
+  "operatorId": "string (UUID v7, required)",
+  "password":   "string (required)",
+  "totpCode":   "string (6 digits, optional)",
+  "recoveryCode": "string (optional, XXXX-XXXX-XXXX 형식)"
+}
+```
+
+- `totpCode`와 `recoveryCode`는 **택일**. 둘 다 제공하거나 둘 다 빠지면 400.
+- `require_2fa=FALSE` 운영자(=2FA 비요구 role 집합)는 둘 다 생략하고 호출한다.
+- `recoveryCode`는 서버가 대문자/하이픈 normalize 후 Argon2id `verify` 비교한다.
+
+**Response 200**:
+```json
+{
+  "accessToken": "eyJhbGciOi... (operator JWT)",
+  "expiresIn": 3600,
+  "refreshToken": "eyJhbGciOi... (operator refresh JWT)",
+  "refreshExpiresIn": 2592000
+}
+```
+
+- `accessToken`: `{sub: operator_uuid, iss: "admin-service", jti: uuidV7, iat, exp, token_type: "admin"}`.
+- `expiresIn`: 초 단위 TTL (기본 3600, `admin.jwt.access-token-ttl-seconds`로 조정).
+- `refreshToken`: `{sub: operator_uuid, iss: "admin-service", jti: uuid, iat, exp, token_type: "admin_refresh"}`. 발급 시 `admin_operator_refresh_tokens(jti)` row가 함께 INSERT 된다(같은 트랜잭션). TASK-BE-040.
+- `refreshExpiresIn`: 초 단위 TTL (기본 2,592,000 = 30일, `admin.jwt.refresh-token-ttl-seconds`로 조정).
+
+**Response 401 (ENROLLMENT_REQUIRED, 2FA 등록이 필요한 경우 body 확장)**:
+```json
+{
+  "code": "ENROLLMENT_REQUIRED",
+  "message": "Operator must complete 2FA enrollment before login",
+  "bootstrapToken": "eyJhbGciOi...",
+  "bootstrapExpiresIn": 600
+}
+```
+
+`bootstrapToken`은 `POST /api/admin/auth/2fa/enroll` 및 `/2fa/verify`에만 사용 가능한 1회용 토큰이다 ([security.md §Bootstrap Token](../../services/admin-service/security.md)).
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 400 | `VALIDATION_ERROR` | 필수 필드(`operatorId`/`password`) 누락 또는 형식 오류 |
+| 400 | `BAD_REQUEST` | `totpCode`와 `recoveryCode`가 동시에 제공되었거나, 2FA가 필요한데 둘 다 미제공 |
+| 401 | `INVALID_CREDENTIALS` | operator 조회 미스 또는 password_hash 불일치. 미스 경로도 dummy Argon2id verify 수행 (타이밍 완화) |
+| 401 | `ENROLLMENT_REQUIRED` | 2FA 필수이나 `admin_operator_totp` row 부재. body에 `bootstrapToken` 포함 |
+| 401 | `INVALID_2FA_CODE` | TOTP 검증 실패 (±1 window 밖) |
+| 401 | `INVALID_RECOVERY_CODE` | recovery code가 어떤 저장된 hash와도 일치하지 않음 (optimistic lock 1회 retry 후) |
+| 500 | `AUDIT_FAILURE` | 성공 경로 감사 row 기록 실패 (fail-closed). 실패 경로의 secondary 감사 실패는 삼켜지고 원래 응답이 유지됨 |
+
+감사: `action_code = OPERATOR_LOGIN`, `target_type = OPERATOR`, `target_id = operator_id`, `permission_used = auth.login`, `reason = "<self_login>"`, `twofa_used = TRUE|FALSE` (2FA 경로 여부), `outcome = SUCCESS|FAILURE`.
+
+---
+
+## POST /api/admin/auth/token-exchange
+
+**TASK-BE-298 / ADR-MONO-014 (ACCEPTED) § D2/D3 — RFC 8693 token exchange.**
+
+platform-console 이 보유한 **GAP OIDC `platform-console-web` access token**
+(subject token)을 단명 **operator access token**(`token_type=admin`,
+`iss=admin-service`)으로 교환한다. console 이 `/api/admin/**` operator
+엔드포인트(BE-296 registry 포함)를 operator trust boundary 확장 없이 호출할 수
+있게 하는 GAP-side bridge다 (ADR-MONO-014 D1 Option A 기각 — `OperatorAuthenticationFilter`
+는 2번째 issuer 를 수용하지 않으며, 본 엔드포인트는 password+TOTP login mint 의
+**형제 발급 경로**일 뿐이다).
+
+**Auth required**: 없음 (body 의 GAP OIDC subject token 이 인증 수단)
+**Required permission**: 없음 (operator-token 발급 경로 — RBAC 평가 대상 아님)
+**X-Operator-Reason**: 요구 없음 (`/login` 과 동일 — 요청자 본인 인증 플로우)
+
+**Headers**: 없음 (subject token 은 Authorization 헤더가 아닌 body)
+
+**Request** (RFC 8693 `application/json`):
+```json
+{
+  "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+  "subject_token": "eyJhbGciOi... (GAP OIDC platform-console-web access token)",
+  "subject_token_type": "urn:ietf:params:oauth:token-type:access_token"
+}
+```
+
+- `grant_type` MUST be `urn:ietf:params:oauth:grant-type:token-exchange`.
+- `subject_token_type` MUST be `urn:ietf:params:oauth:token-type:access_token`.
+- `subject_token` 은 auth-service(SAS)가 `platform-console-web` client 에
+  발급한 OIDC access token. 검증 정책(JWKS·iss·aud·exp·nbf·RS256·clock skew)은
+  [security.md §GAP OIDC Subject-Token Validation](../../services/admin-service/security.md)
+  가 canonical.
+- 이 엔드포인트는 **재발급(re-exchange)** 모델이다 — 별도 operator-refresh
+  state 를 두지 않는다 (ADR-MONO-014 D2). console 은 자신의 GAP refresh 로
+  rotate 한 access token 으로 매번 재교환한다.
+
+**Response 200**:
+```json
+{
+  "accessToken": "eyJhbGciOi... (operator JWT)",
+  "expiresIn": 3600,
+  "tokenType": "admin"
+}
+```
+
+- `accessToken`: `/api/admin/auth/login` 성공 응답의 `accessToken` 과
+  **동일 구조·동일 발급기·동일 서명 키**: `{sub: operator_uuid,
+  iss: "admin-service", jti: uuidV7, iat, exp, token_type: "admin"}`. tenant
+  스코프는 **`admin_operators.tenant_id` 에서만** 결정된다 (ADR-002 `'*'`
+  SUPER_ADMIN sentinel 포함) — subject token 의 어떤 claim(`tenant_id` 등)도
+  스코프 결정에 사용하지 않는다.
+- `expiresIn`: 초 단위 TTL. operator access TTL
+  (`admin.jwt.access-token-ttl-seconds`, 기본 3600) 이하.
+- refresh token 은 발급하지 않는다 (re-exchange 모델, ADR-MONO-014 D2).
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 400 | `VALIDATION_ERROR` | `subject_token` 누락 |
+| 400 | `BAD_REQUEST` | `grant_type` 또는 `subject_token_type` 가 RFC 8693 지정 값과 불일치 |
+| 401 | `TOKEN_INVALID` | subject token 서명/`iss`/`aud`/`exp`/`nbf` 검증 실패, `platform-console-web` 가 아닌 client 에 발급된 토큰, GAP OIDC access token 이 아님(예: operator/bootstrap 토큰 제시), auth-service JWKS 도달 불가, **또는** OIDC subject 에 매핑되는 활성 `admin_operators` row 부재(미매핑/비활성/잠금 — fail-closed, 토큰 미발급) |
+
+> **Fail-closed invariant**: subject token 검증 또는 operator 해석의
+> 어떠한 모호함도 `401 TOKEN_INVALID`(기존 `OperatorUnauthorizedException`)로
+> 귀결되며 **operator token 은 절대 발급되지 않는다**. OIDC token 으로부터
+> 스코프가 상승하는 경로는 존재하지 않는다.
+
+**Side Effects**: 없음 (`admin_actions` 기록 없음 — `/login` 과 달리 이
+엔드포인트는 자체 감사 row 를 남기지 않는다. 후속 operator 명령이 각자의 감사
+row 를 남긴다. operator-token 발급 자체의 추적은 GAP OIDC subject token 의
+auth-service 측 발급 이력으로 커버됨). OIDC↔operator 링크 키 결정·근거는
+[data-model.md §OIDC Subject ↔ Operator Link Key](../../services/admin-service/data-model.md).
+
+---
+
+## POST /api/admin/auth/refresh
+
+운영자 refresh JWT를 회전시켜 새 access + refresh 쌍을 발급한다. TASK-BE-040.
+
+**Auth required**: 없음 (body의 refresh JWT가 인증 수단)
+**Required permission**: 없음 (self-managed session)
+**X-Operator-Reason**: 요구 없음 (`admin_actions.reason = "<self_refresh>"` 상수 기록)
+
+**Headers**: 없음
+
+**Request**:
+```json
+{
+  "refreshToken": "string (required, operator refresh JWT)"
+}
+```
+
+**Behavior**:
+1. JWT 서명/exp/iss 검증 + `token_type=admin_refresh` 확인
+2. `admin_operator_refresh_tokens.findByJti(jti)` 조회 — 미존재 → 401 `INVALID_REFRESH_TOKEN`
+3. row.`revoked_at != null` → **재사용 탐지**: 해당 operator의 모든 미revoked refresh token을 `revoke_reason=REUSE_DETECTED`로 일괄 revoke + 401 `REFRESH_TOKEN_REUSE_DETECTED`
+4. 정상: 기존 jti를 `revoke_reason=ROTATED`로 revoke, 새 access + 새 refresh 발급, 새 row insert(`rotated_from`=기존 jti)
+
+**Response 200**:
+```json
+{
+  "accessToken": "eyJhbGciOi...",
+  "expiresIn": 3600,
+  "refreshToken": "eyJhbGciOi...",
+  "refreshExpiresIn": 2592000
+}
+```
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 400 | `VALIDATION_ERROR` | `refreshToken` 누락 |
+| 401 | `INVALID_REFRESH_TOKEN` | 서명/exp/issuer 실패, `token_type` 불일치, jti 미등록, operator 불일치 |
+| 401 | `REFRESH_TOKEN_REUSE_DETECTED` | 이미 revoked된 jti의 재사용 — 체인 전체 invalidate |
+
+감사: `action_code = OPERATOR_REFRESH`, `target_type = OPERATOR`, `target_id = operator_id`, `permission_used = auth.refresh`, `reason = "<self_refresh>"`, `outcome = SUCCESS|FAILURE`(REUSE_DETECTED 시 `downstream_detail = "REUSE_DETECTED"`).
+
+---
+
+## POST /api/admin/auth/logout
+
+운영자 자체 logout. access JWT의 jti를 Redis 블랙리스트에 등록하고(잔여 TTL), 선택적으로 제공된 refresh token을 revoke한다. 204를 응답. TASK-BE-040.
+
+**Auth required**: Yes (operator JWT, `token_type=admin`) — 본인 확인 위해 인증 필요. 029-1 bypass 목록에 포함되지 않는다.
+**Required permission**: 없음 (self-managed session)
+**X-Operator-Reason**: 요구 없음 (`admin_actions.reason = "<self_logout>"` 상수 기록)
+
+**Headers**:
+- `Authorization: Bearer <operator-token>`
+
+**Request** (optional body):
+```json
+{
+  "refreshToken": "string (optional)"
+}
+```
+
+**Behavior**:
+- access JWT의 jti를 Redis SETEX `admin:jti:blacklist:{jti}`, TTL = (access exp - now). `OperatorAuthenticationFilter`는 이 키를 매 요청마다 확인하여 hit 시 401 `TOKEN_REVOKED` 반환. Redis 다운 시 fail-closed (401).
+- `refreshToken`이 제공되면 그 jti를 `revoke_reason=LOGOUT`으로 revoke. 미제공이거나 검증 실패 시 무시 (best-effort).
+
+**Response 204**: 본문 없음
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 401 | `TOKEN_INVALID` | operator JWT 누락/만료/변조 |
+| 401 | `TOKEN_REVOKED` | 이미 logout된 jti로 재호출 |
+| 500 | `INTERNAL_ERROR` | Redis blacklist 쓰기 실패 — 클라이언트 재시도 |
+
+감사: `action_code = OPERATOR_LOGOUT`, `target_type = OPERATOR`, `target_id = operator_id`, `permission_used = auth.logout`, `reason = "<self_logout>"`, `outcome = SUCCESS|FAILURE`.
+
+---
+
+## POST /api/admin/auth/2fa/enroll
+
+운영자 자신의 TOTP 2FA 최초(또는 재) 등록. 서버가 160-bit secret 생성·AES-GCM 암호화 저장, Argon2id hash된 10개 recovery codes를 동시 발급한다.
+
+**Auth required**: Bootstrap token (operator JWT 불가). `Authorization: Bearer <bootstrap-token>`, `token_type = "admin_bootstrap"`, `jti` 1회 소비 (상세: [security.md §Bootstrap Token](../../services/admin-service/security.md)).
+**Required permission**: 없음 (self-enrollment)
+**X-Operator-Reason**: 요구 없음 (`admin_actions.reason = "<self_enrollment>"` 상수 기록)
+
+**Headers**:
+- `Authorization: Bearer <bootstrap-token>`
+
+**Request**: body 없음
+
+**Response 200**:
+```json
+{
+  "otpauthUri": "otpauth://totp/admin-service:op@example.com?secret=...&issuer=admin-service&algorithm=SHA1&digits=6&period=30",
+  "recoveryCodes": ["A1B2-C3D4-E5F6", "..."],
+  "enrolledAt": "2026-04-14T10:00:00Z"
+}
+```
+
+`recoveryCodes`는 **평문 1회 응답 후 서버 저장은 Argon2id 해시만**. 재호출 시 기존 secret + recovery codes는 전부 무효화되고 새 값으로 대체된다.
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 401 | `INVALID_BOOTSTRAP_TOKEN` | bootstrap token 부재/만료/재사용(jti 소비됨)/서명 실패/`token_type` 불일치 |
+| 500 | `AUDIT_FAILURE` | 감사 row 기록 실패 (fail-closed) |
+
+감사: `action_code = OPERATOR_2FA_ENROLL`, `target_type = OPERATOR`, `target_id = operator_id`, `permission_used = auth.2fa_enroll`, `twofa_used = FALSE`, `outcome = SUCCESS|FAILURE`.
+
+---
+
+## POST /api/admin/auth/2fa/verify
+
+Enroll 직후 또는 로그인 플로우(TASK-BE-029-3)에서 운영자가 제출한 TOTP 코드를 검증한다. 성공 시 `admin_operator_totp.last_used_at`이 갱신된다.
+
+**Auth required**: Bootstrap token.
+**Required permission**: 없음 (self-enrollment)
+**X-Operator-Reason**: 요구 없음
+
+**Headers**:
+- `Authorization: Bearer <bootstrap-token>`
+
+**Request**:
+```json
+{
+  "totpCode": "string (6 digits, required)"
+}
+```
+
+**Response 200**:
+```json
+{ "verified": true }
+```
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 400 | `VALIDATION_ERROR` | `totpCode`이 6자리 숫자가 아님 |
+| 401 | `INVALID_BOOTSTRAP_TOKEN` | bootstrap token 부재/만료/재사용/서명 실패 |
+| 401 | `INVALID_2FA_CODE` | 코드가 ±1 window(30s step) 안에서 일치하지 않음 (enrollment 미존재 시 동일 코드 반환) |
+| 500 | `AUDIT_FAILURE` | 감사 row 기록 실패 |
+
+감사: `action_code = OPERATOR_2FA_VERIFY`, `target_type = OPERATOR`, `permission_used = auth.2fa_verify`, `twofa_used = FALSE` (본 엔드포인트 자체는 로그인 경로가 아님 — `twofa_used = TRUE`는 029-3의 `/login` 감사 row에서 기록).
+
+---
+
+## POST /api/admin/auth/2fa/recovery-codes/regenerate
+
+운영자가 TOTP 백업 복구 코드를 모두 소진하거나 분실한 경우 새로운 10개 코드 세트를 발급받는다. 호출 시 기존 `recovery_codes_hashed`는 즉시 완전 교체되며 이전 코드는 무효화된다.
+
+**Auth required**: Yes (operator JWT, `token_type=admin`) — 정식 operator 토큰 필요. bootstrap token 사용 불가.
+**Required permission**: 없음 (self-service: 본인의 복구 코드만 재발급)
+**X-Operator-Reason**: 요구 없음 (`admin_actions.reason = "<self_recovery_regenerate>"` 상수 기록)
+
+**Headers**:
+- `Authorization: Bearer <operator-token>`
+
+**Request**: body 없음
+
+**Response 200**:
+```json
+{
+  "recoveryCodes": ["A1B2-C3D4-E5F6", "G7H8-I9J0-K1L2", "..."]
+}
+```
+
+`recoveryCodes`는 **평문 1회 응답 후 서버 저장은 Argon2id 해시만**. 정확히 10개 반환된다. 응답 직후 클라이언트가 안전하게 저장해야 하며 서버는 이후 평문 코드를 보유하지 않는다.
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 401 | `TOKEN_INVALID` | operator JWT 누락/만료/변조 |
+| 401 | `TOKEN_REVOKED` | 이미 logout된 jti |
+| 404 | `TOTP_NOT_ENROLLED` | `admin_operator_totp` row 부재 (TOTP 미등록 상태에서는 재발급 불가 — 먼저 `/api/admin/auth/2fa/enroll` 필요) |
+
+**Side Effects**: `admin_operator_totp.recovery_codes_hashed` 컬럼이 새 JSON 배열로 완전히 교체된다 (이전 코드 즉시 무효화). `last_used_at`도 함께 갱신된다.
+
+**Note**: 본 엔드포인트는 평문 복구 코드를 응답으로만 반환하며 서버 로그에 출력하지 않는다 (R4 준수).
+
+---
+
+## Operator Roles
+
+**Reference matrix**: Role × permission 매트릭스의 canonical source는 [specs/services/admin-service/rbac.md — Seed Matrix](../../services/admin-service/rbac.md#seed-matrix-role--permission) 한 곳이다. 본 계약에서는 중복 테이블을 유지하지 않는다 (drift 방지).
+
+### 403 Response Shape
+
+`PERMISSION_DENIED` 응답은 본 문서의 [Common Error Format](#common-error-format)을 따른다. permission 관련 추가 필드는 응답에 **노출하지 않는다** (attack surface 축소 — 클라이언트는 어떤 permission이 누락되었는지 알 수 없다). 거부 상세는 `admin_actions.detail`에만 기록된다.
+
+```json
+{
+  "code": "PERMISSION_DENIED",
+  "message": "Operator is not authorized to perform this action.",
+  "timestamp": "2026-04-13T10:00:00Z"
+}
+```
+
+---
+
+## POST /api/admin/accounts/{accountId}/gdpr-delete
+
+GDPR/PIPA 삭제권 이행. 계정 상태를 DELETED로 전이하고 PII를 즉시 마스킹한다 (이메일 SHA-256 해시 교체, 프로필 필드 NULL 처리).
+
+**Auth required**: Yes (operator token, `token_type=admin`)
+**Required permission**: `account.lock` (기존 권한 재사용)
+**Granted to roles**: `SUPER_ADMIN`, `SUPPORT_LOCK`
+
+**Headers**:
+- `Authorization: Bearer <operator-token>`
+- `X-Operator-Reason: string (required, 감사 사유)`
+- `Idempotency-Key: string (required)`
+
+**Request**:
+```json
+{
+  "reason": "string (required, GDPR 삭제 사유)",
+  "ticketId": "string (optional, 내부 티켓 번호)"
+}
+```
+
+**Response 200**:
+```json
+{
+  "accountId": "string",
+  "status": "DELETED",
+  "maskedAt": "2026-04-18T10:00:00Z",
+  "auditId": "string (admin_actions.id)"
+}
+```
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 401 | `TOKEN_INVALID` | operator token 만료/변조 |
+| 403 | `PERMISSION_DENIED` | role 부족 |
+| 400 | `STATE_TRANSITION_INVALID` | 이미 DELETED 상태 |
+| 400 | `REASON_REQUIRED` | X-Operator-Reason 또는 body reason 누락 |
+| 404 | `ACCOUNT_NOT_FOUND` | 대상 계정 미존재 |
+| 503 | `DOWNSTREAM_ERROR` | account-service 호출 실패 (5xx/timeout) |
+| 503 | `CIRCUIT_OPEN` | account-service circuit breaker OPEN |
+
+**Side Effects**: admin_actions 감사 기록 + `admin.action.performed` 이벤트 + account-service에 내부 HTTP GDPR 삭제 명령. PII 마스킹은 account-service 내에서 동일 트랜잭션으로 수행.
+
+---
+
+## GET /api/admin/accounts/{accountId}/export
+
+GDPR/PIPA 이식권 이행. 계정의 개인 데이터를 JSON으로 내보낸다.
+
+**Auth required**: Yes (operator token, `token_type=admin`)
+**Required permission**: `audit.read`
+**Granted to roles**: `SUPER_ADMIN`, `SUPPORT_READONLY`, `SECURITY_ANALYST`
+
+**Headers**:
+- `Authorization: Bearer <operator-token>`
+- `X-Operator-Reason: string (required, 감사 사유)`
+
+**Response 200**:
+```json
+{
+  "accountId": "string",
+  "email": "string",
+  "status": "string",
+  "createdAt": "2026-01-01T00:00:00Z",
+  "profile": {
+    "displayName": "string",
+    "phoneNumber": "string",
+    "birthDate": "1990-01-15",
+    "locale": "ko-KR",
+    "timezone": "Asia/Seoul"
+  },
+  "exportedAt": "2026-04-18T10:00:00Z"
+}
+```
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 401 | `TOKEN_INVALID` | operator token 만료/변조 |
+| 403 | `PERMISSION_DENIED` | role 부족 |
+| 404 | `ACCOUNT_NOT_FOUND` | 대상 계정 미존재 |
+| 503 | `DOWNSTREAM_ERROR` | account-service 호출 실패 (5xx/timeout) |
+| 503 | `CIRCUIT_OPEN` | account-service circuit breaker OPEN |
+
+**Side Effects**: 이 조회 자체가 **meta-audit**로 기록됨 (admin_actions에 action_code=DATA_EXPORT, outcome=SUCCESS). PII가 마스킹되지 않은 원본 데이터 접근이므로 감사 추적 필수.
+
+---
+
+## GET /api/admin/me
+
+현재 로그인한 운영자의 정보를 반환한다.
+
+**Auth required**: Yes (operator token, `token_type=admin`)
+**Required permission**: 없음 (유효한 operator JWT만 필요)
+
+**Response 200**:
+```json
+{
+  "operatorId": "string (UUID v7)",
+  "email": "string",
+  "displayName": "string",
+  "status": "ACTIVE",
+  "roles": ["SUPER_ADMIN"],
+  "totpEnrolled": true,
+  "lastLoginAt": "2026-04-24T10:00:00Z",
+  "createdAt": "2026-01-01T00:00:00Z"
+}
+```
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 401 | `TOKEN_INVALID` | operator token 만료/변조 |
+
+---
+
+## GET /api/admin/operators
+
+운영자 목록 조회 (페이지네이션). **TASK-MONO-175 / ADR-MONO-020**: 결과는 `tenantId`(활성 테넌트)로 스코핑된다 — 해당 테넌트에 **속한** 운영자(HOME 테넌트 `admin_operators.tenant_id == tenantId` **또는** `operator_tenant_assignment` 에 `tenantId` 배정(D1 N:M, TASK-BE-326))만 반환.
+
+> **TASK-BE-338 (ADR-MONO-020 D3 amendment)**: `operator_tenant_assignment.org_scope`(per-assignment 데이터-스코프, 부서 subtree-root id 배열; `NULL ⟺ ["*"]` net-zero)는 이 list 응답(`/api/admin/operators`)에는 노출되지 않으며, internal assignment-check edge([internal/auth-to-admin.md](./internal/auth-to-admin.md) `GET /internal/operator-assignments/check` 의 `orgScope` 응답 필드)로 반환되어 assume-tenant 토큰 `org_scope` claim 으로 전파된다.
+>
+> **TASK-BE-339 (ADR-MONO-020 D3 amendment follow-up)**: org_scope **조회·설정 admin API 가 추가됨** — `GET /api/admin/operators/{operatorId}/assignments`(활성 테넌트 scope, org_scope 포함) + `PUT /api/admin/operators/{operatorId}/assignments/{tenantId}/org-scope`(set/clear, reason-gated). 콘솔 설정 UI(TASK-PC-FE-050)가 이 API 를 소비해 SQL 시드 없이 운영자별 데이터-스코프를 설정한다. (이전 "set/write API 는 follow-up" note 는 본 task 로 해소.)
+
+**Auth required**: Yes (operator token, `token_type=admin`)
+**Required permission**: `operator.manage`
+**Granted to roles**: `SUPER_ADMIN`
+
+**Query Parameters**:
+
+| 파라미터 | 타입 | 설명 |
+|---|---|---|
+| `status` | string (optional) | `ACTIVE` 또는 `SUSPENDED` 필터. 미지정 시 전체 반환 |
+| `tenantId` | string (optional) | **TASK-MONO-175** — 조회할 테넌트(활성 테넌트). 생략 시 운영자 자신의 home 테넌트. `*` 는 SUPER_ADMIN(플랫폼 스코프) 전용 — 크로스 테넌트 전체 목록. 일반 운영자가 자신의 **effective scope**(home ∪ 배정, TASK-BE-326 dual-read) 밖의 `tenantId` 를 지정하면 `403 TENANT_SCOPE_DENIED`. console-web 은 활성 테넌트 쿠키 값을 기본 전달(audit `GET /api/admin/audit` 의 `tenantId` 와 동일 패턴). |
+| `page` | int (default 0) | 페이지 번호 |
+| `size` | int (default 20, max 100) | 페이지 크기 |
+
+**Response 200**:
+```json
+{
+  "content": [
+    {
+      "operatorId": "string (UUID v7)",
+      "email": "string",
+      "displayName": "string",
+      "status": "ACTIVE",
+      "roles": ["SUPPORT_LOCK"],
+      "totpEnrolled": false,
+      "lastLoginAt": "2026-04-24T10:00:00Z",
+      "createdAt": "2026-01-01T00:00:00Z",
+      "operatorContext": {
+        "defaultAccountId": "acc-uuid-7"
+      }
+    }
+  ],
+  "totalElements": 10,
+  "page": 0,
+  "size": 20,
+  "totalPages": 1
+}
+```
+
+**Response item shape (per-operator)**:
+
+| 필드 | 타입 | 조건 |
+|---|---|---|
+| `operatorId` | string (UUID v7) | 항상 노출 |
+| `email` | string | 항상 노출 |
+| `displayName` | string | 항상 노출 |
+| `status` | enum (`ACTIVE` / `SUSPENDED`) | 항상 노출 |
+| `roles` | array<string> | 항상 노출 (빈 배열 허용) |
+| `totpEnrolled` | boolean | 항상 노출 |
+| `lastLoginAt` | string (ISO-8601) \| absent | 한 번도 로그인하지 않은 운영자는 키 자체 omit |
+| `createdAt` | string (ISO-8601) | 항상 노출 |
+| `operatorContext` | object \| **omit** | profile carrier (TASK-BE-308 신규). `admin_operators.finance_default_account_id` 가 NULL 이면 키 자체 omit (field-level `@JsonInclude(Include.NON_NULL)`); 값이 있으면 `{ "defaultAccountId": "<uuid>" }` 형태로 노출. v1 은 `defaultAccountId` 단일 키만 carrying — `me/profile` (TASK-BE-306) + `{operatorId}/profile` (TASK-BE-307) request body 의 carrier 와 동일 shape. console-web admin profile-edit dialog 가 dialog 초기값으로 사용 (TASK-PC-FE-018). v1 finance 단일 카드만 populating; 다른 carrier 키는 별 task 로 컬럼+노출 동시 확장 |
+
+> **carrier shape 대칭성 (TASK-BE-308)**: 본 list 응답의 item-level `operatorContext` 은 다음과 byte-identical 한 shape 를 사용한다:
+> - `GET /api/admin/console/registry` 응답의 finance product item 의 `operatorContext` ([console-registry-api.md § Item shape](./console-registry-api.md))
+> - `PATCH /api/admin/operators/me/profile` (TASK-BE-306) request body 의 `operatorContext`
+> - `PATCH /api/admin/operators/{operatorId}/profile` (TASK-BE-307) request body 의 `operatorContext`
+>
+> 결과적으로 console-web 은 동일 zod schema / TypeScript 타입으로 4개 surface 를 통일 처리한다 (read on list + read on registry + write on me/profile + write on admin/{id}/profile).
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 401 | `TOKEN_INVALID` | operator token 만료/변조 |
+| 403 | `PERMISSION_DENIED` | `operator.manage` 권한 없음 |
+| 403 | `TENANT_SCOPE_DENIED` | **TASK-MONO-175** — 일반(비-플랫폼) 운영자가 effective scope(home ∪ 배정) 밖의 `tenantId` 를 지정한 경우 |
+| 400 | `VALIDATION_ERROR` | size > 100 또는 status 값 오류 |
+
+**Side Effects**: 없음 (read).
+
+---
+
+## GET /api/admin/operators/{operatorId}/assignments
+
+**TASK-BE-339 (ADR-MONO-020 D3 amendment follow-up)** — 운영자의 `operator_tenant_assignment` 행을 **활성 테넌트(`X-Tenant-Id`)로 scope** 하여 반환한다. 0 또는 1행(per-(operator, active-tenant)); 활성 테넌트에 명시 배정이 없으면 빈 배열(`home-tenant-only` 운영자 → org_scope 부적용 신호). 타 테넌트 assignment 는 노출하지 않는다.
+
+**Auth required**: Yes (operator token, `token_type=admin`)
+**Required permission**: `operator.manage`
+**Granted to roles**: `SUPER_ADMIN`
+
+**Headers**:
+- `Authorization: Bearer <operator-token>`
+- `X-Tenant-Id: string (활성 테넌트 — 생략 시 빈 배열)`
+
+**Path Variable**: `operatorId` — 대상 운영자의 `admin_operators.operator_id` (UUID v7)
+
+**Response 200**:
+```json
+{
+  "assignments": [
+    {
+      "tenantId": "acme-corp",
+      "orgScope": ["dept-sales", "dept-eng"],
+      "permissionSetId": 7
+    }
+  ]
+}
+```
+
+**Response item shape (per-assignment)**:
+
+| 필드 | 타입 | 조건 |
+|---|---|---|
+| `tenantId` | string | 항상 노출 (= 활성 테넌트) |
+| `orgScope` | array<string> \| **omit** | 부서 subtree-root id 배열. 컬럼 `NULL`(미설정, `⟺ ["*"]` net-zero)이면 키 자체 omit (field-level `@JsonInclude(NON_NULL)` — `"orgScope": null` 로 렌더링하지 않음). 명시적 `[]`(zero-scope)는 비-null 이므로 노출 |
+| `permissionSetId` | number \| **omit** | per-assignment permission set (`admin_roles.id`). `NULL`(operator-level role 상속)이면 omit |
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 401 | `TOKEN_INVALID` | operator token 만료/변조 |
+| 403 | `PERMISSION_DENIED` | `operator.manage` 권한 없음 |
+| 404 | `OPERATOR_NOT_FOUND` | operatorId 미존재 |
+
+**Side Effects**: 없음 (read).
+
+---
+
+## PUT /api/admin/operators/{operatorId}/assignments/{tenantId}/org-scope
+
+**TASK-BE-339 (ADR-MONO-020 D3 amendment follow-up)** — (operator, tenant) assignment 행의 `org_scope`(부서 subtree-root id 배열)를 **설정·해제**한다. 운영자-admin 은 자기 **활성 테넌트** 내 assignment 만 관리할 수 있으므로 `path tenantId` 는 `X-Tenant-Id` 와 일치해야 한다. org_scope 는 assignment 행에만 존재하며, 행 생성/삭제(운영자를 테넌트에 배정/해제)는 본 task 범위 밖이다.
+
+**Auth required**: Yes (operator token, `token_type=admin`)
+**Required permission**: `operator.manage`
+**Granted to roles**: `SUPER_ADMIN`
+
+**Headers**:
+- `Authorization: Bearer <operator-token>`
+- `X-Tenant-Id: string (required, 활성 테넌트 — path tenantId 와 일치해야 함)`
+- `X-Operator-Reason: string (required, 감사 사유)`
+
+**Path Variables**:
+- `operatorId` — 대상 운영자의 `admin_operators.operator_id` (UUID v7)
+- `tenantId` — assignment 의 테넌트 (활성 테넌트와 일치해야 함)
+
+**Request**:
+```json
+{
+  "orgScope": ["dept-sales", "dept-eng"]
+}
+```
+
+`orgScope` 값 의미 (end-to-end 보존):
+
+| 값 | 의미 | 영속 |
+|---|---|---|
+| `null` (또는 키 생략) | clear (전체 테넌트, `⟺ ["*"]` net-zero) | 컬럼 `NULL` |
+| `[]` | 명시적 zero-scope (`NULL` 과 구분, BE-338 fail-closed 의미) | 빈 JSON 배열 `[]` |
+| `["<dept-id>", ...]` | 정규화(trim · blank 거부 · 중복 제거 order 보존 · 최대 256개) 후 영속. GAP 은 erp 부서 트리를 모르므로 id 형식·존재 검증 안 함(비-blank 문자열만; erp 가 소비 시점 검증, ERP-BE-008) | JSON 배열 |
+
+**Response 200** (갱신된 assignment — `GET .../assignments` element 와 동일 shape):
+```json
+{
+  "tenantId": "acme-corp",
+  "orgScope": ["dept-sales", "dept-eng"],
+  "permissionSetId": 7
+}
+```
+
+`orgScope` 가 `null`(clear)이면 응답에서도 키 omit (`@JsonInclude(NON_NULL)`).
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 401 | `TOKEN_INVALID` | operator token 만료/변조 |
+| 403 | `PERMISSION_DENIED` | `operator.manage` 권한 없음 |
+| 403 | `TENANT_SCOPE_MISMATCH` | `path tenantId != X-Tenant-Id` (자기 활성 테넌트 밖 assignment 편집 시도) |
+| 404 | `OPERATOR_NOT_FOUND` | operatorId 미존재 |
+| 404 | `ASSIGNMENT_NOT_FOUND` | (operatorId, tenantId) assignment 행 부재 (org_scope 는 assignment 행 전용) |
+| 400 | `REASON_REQUIRED` | `X-Operator-Reason` 헤더 누락 |
+| 400 | `INVALID_REQUEST` | `orgScope` 배열에 blank 원소 포함 / 256개 초과 |
+
+**Side Effects**: 성공 시 행 `org_scope` 컬럼 `saveAndFlush`(BE-335 명시 flush — dirty UPDATE 영속 보장). `admin_actions` 에 `action_code=OPERATOR_ORG_SCOPE_UPDATE, permission_used=operator.manage, target_id=operatorId, target_tenant_id=path tenantId` 기록. 갱신된 `org_scope` 는 다음 assume-tenant 토큰 발급 시 `org_scope` claim 으로 전파(BE-338).
+
+---
+
+## POST /api/admin/operators
+
+신규 운영자 계정 생성.
+
+**Auth required**: Yes (operator token, `token_type=admin`)
+**Required permission**: `operator.manage`
+**Granted to roles**: `SUPER_ADMIN`
+
+**Headers**:
+- `Authorization: Bearer <operator-token>`
+- `X-Operator-Reason: string (required)`
+- `Idempotency-Key: string (required)`
+
+**Request**:
+```json
+{
+  "email": "string (required, valid email format)",
+  "displayName": "string (required, 1–64자)",
+  "password": "string (required, ≥10자, 영문+숫자+특수문자 각 1자 이상)",
+  "roles": ["SUPPORT_LOCK"],
+  "tenantId": "string (required, 1–32자, TASK-BE-249)"
+}
+```
+
+> `tenantId`: 생성할 운영자가 속할 테넌트 ID. `*`는 SUPER_ADMIN 전용 플랫폼 스코프 센티넬이며, 플랫폼 스코프(`tenant_id='*'`) 운영자만 다른 플랫폼 스코프 운영자를 생성할 수 있다. 이를 위반하면 `403 TENANT_SCOPE_DENIED`.
+
+**Response 201**:
+```json
+{
+  "operatorId": "string (UUID v7)",
+  "email": "string",
+  "displayName": "string",
+  "status": "ACTIVE",
+  "roles": ["SUPPORT_LOCK"],
+  "totpEnrolled": false,
+  "createdAt": "2026-04-24T10:00:00Z",
+  "auditId": "string (admin_actions.id)",
+  "tenantId": "string (TASK-BE-249)"
+}
+```
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 401 | `TOKEN_INVALID` | operator token 만료/변조 |
+| 403 | `PERMISSION_DENIED` | `operator.manage` 권한 없음 |
+| 403 | `TENANT_SCOPE_DENIED` | 비-플랫폼 스코프 운영자가 `tenantId='*'` 운영자 생성 시도 (TASK-BE-249) |
+| 409 | `OPERATOR_EMAIL_CONFLICT` | 동일 (tenant_id, email) 운영자 이미 존재 |
+| 400 | `ROLE_NOT_FOUND` | `roles` 배열에 존재하지 않는 role 이름 포함 |
+| 400 | `VALIDATION_ERROR` | email 형식 오류 / password 정책 위반 / displayName 길이 초과 / tenantId 누락 또는 32자 초과 |
+
+**Side Effects**: 성공 시 `admin_actions`에 `action_code=OPERATOR_CREATE, tenant_id=actor.tenantId, target_tenant_id=body.tenantId` 기록. `403 TENANT_SCOPE_DENIED` 시 `admin_actions`에 `outcome=DENIED, tenant_id=actor's, target_tenant_id=actor's, downstream_detail`에 시도한 `body.tenantId` 기록 — best-effort 쓰기 (TASK-BE-262). 실패해도 403 자체는 정상 반환되며 `admin.audit.cross_tenant_deny_failure` 메트릭이 증가한다.
+
+---
+
+## PATCH /api/admin/operators/{operatorId}/roles
+
+운영자의 역할 목록 전체 교체.
+
+**Auth required**: Yes (operator token, `token_type=admin`)
+**Required permission**: `operator.manage`
+**Granted to roles**: `SUPER_ADMIN`
+
+**Headers**:
+- `Authorization: Bearer <operator-token>`
+- `X-Operator-Reason: string (required)`
+
+**Path Variable**: `operatorId` — 대상 운영자의 `admin_operators.operator_id` (UUID v7)
+
+**Request**:
+```json
+{
+  "roles": ["SUPPORT_READONLY", "SECURITY_ANALYST"]
+}
+```
+
+`roles` 빈 배열(`[]`) 허용 — 역할 전부 제거.
+
+**Response 200**:
+```json
+{
+  "operatorId": "string",
+  "roles": ["SUPPORT_READONLY", "SECURITY_ANALYST"],
+  "auditId": "string"
+}
+```
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 401 | `TOKEN_INVALID` | operator token 만료/변조 |
+| 403 | `PERMISSION_DENIED` | `operator.manage` 권한 없음 |
+| 404 | `OPERATOR_NOT_FOUND` | operatorId 미존재 |
+| 400 | `ROLE_NOT_FOUND` | roles 배열에 존재하지 않는 role 이름 포함 |
+
+**Side Effects**: `admin_actions`에 `action_code=OPERATOR_ROLE_CHANGE` 기록. Redis 권한 캐시 즉시 invalidate (`admin:operator:perm:{operatorId}`).
+
+---
+
+## PATCH /api/admin/operators/{operatorId}/status
+
+운영자 계정 상태 변경.
+
+**Auth required**: Yes (operator token, `token_type=admin`)
+**Required permission**: `operator.manage`
+**Granted to roles**: `SUPER_ADMIN`
+
+**Headers**:
+- `Authorization: Bearer <operator-token>`
+- `X-Operator-Reason: string (required)`
+
+**Path Variable**: `operatorId` — 대상 운영자의 `admin_operators.operator_id` (UUID v7)
+
+**Request**:
+```json
+{
+  "status": "SUSPENDED"
+}
+```
+
+허용 값: `ACTIVE`, `SUSPENDED`.
+
+**Response 200**:
+```json
+{
+  "operatorId": "string",
+  "previousStatus": "ACTIVE",
+  "currentStatus": "SUSPENDED",
+  "auditId": "string"
+}
+```
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 401 | `TOKEN_INVALID` | operator token 만료/변조 |
+| 403 | `PERMISSION_DENIED` | `operator.manage` 권한 없음 |
+| 404 | `OPERATOR_NOT_FOUND` | operatorId 미존재 |
+| 400 | `SELF_SUSPEND_FORBIDDEN` | 본인 계정 SUSPENDED 시도 |
+| 400 | `STATE_TRANSITION_INVALID` | 현재 status와 요청 status가 동일 |
+| 400 | `VALIDATION_ERROR` | status 값이 허용 목록 외 |
+
+**Side Effects**: `SUSPENDED` 처리 시 해당 운영자의 모든 refresh token 즉시 무효화. `admin_actions`에 `action_code=OPERATOR_STATUS_CHANGE` 기록.
+
+---
+
+## PATCH /api/admin/operators/{operatorId}/profile
+
+대상 운영자의 프로파일 carrier (`operatorContext`) 를 변경한다 — admin-on-behalf-of 경로. v1 은 **`finance_default_account_id` 단일 필드**만 수용한다 (TASK-BE-304 column / TASK-BE-306 self-serve sister; 본 task TASK-BE-307 admin sister). SUPER_ADMIN 이 다른 운영자의 platform-console `Operator Overview` finance 기본 계정을 provisioning 할 때 사용. **본인 (self) 변경은 본 endpoint 가 아닌 `PATCH /api/admin/operators/me/profile` (자가 변경, 별도 audit reason 포맷)** 사용.
+
+**Auth required**: Yes (operator token, `token_type=admin`)
+**Required permission**: `operator.manage`
+**Granted to roles**: `SUPER_ADMIN`
+
+**Headers**:
+- `Authorization: Bearer <operator-token>`
+- `X-Operator-Reason: string (required)` — 자가 변경 면제 사항 아님 (다른 대상에 대한 운영 명령)
+
+**Path Variable**: `operatorId` — 대상 운영자의 `admin_operators.operator_id` (UUID v7)
+
+**Request**
+
+```
+PATCH /api/admin/operators/{operatorId}/profile
+Content-Type: application/json
+```
+
+```json
+{
+  "operatorContext": {
+    "defaultAccountId": "acc-uuid-7"
+  }
+}
+```
+
+값을 **clear** 하려면 `defaultAccountId` 에 `null` 을 명시 (BE-306 `me/profile` 와 동일 규약):
+
+```json
+{
+  "operatorContext": {
+    "defaultAccountId": null
+  }
+}
+```
+
+| 필드 | 타입 | 필수 | 설명 |
+|---|---|---|---|
+| `operatorContext` | object | ✅ | 프로파일 attribute carrier. v1 은 `defaultAccountId` 단일 키만 수용 (`FAIL_ON_UNKNOWN_PROPERTIES`); 누락된 빈 body / 빈 객체 → 400 |
+| `operatorContext.defaultAccountId` | string \| null | ✅ | finance-platform 계정 UUID (`VARCHAR(36)`, opaque — GAP 는 finance 에 verify 하지 않음, TASK-BE-304 § Decision authority). `null` = clear. 빈 문자열 / whitespace-only / 36자 초과 / 내부 공백·control char → 400 `INVALID_REQUEST` |
+
+> **Body shape parity with `/me/profile`**: 본 endpoint 와 self-serve `/me/profile` (BE-306) 의 request body 는 **byte-identical**. UI 는 동일 form/parser 재사용 가능; producer 측은 caller-target 관계 (self vs cross-operator) 만 분기.
+
+**Response**
+
+`204 No Content` — 변경 성공, 본문 없음. 변경된 effective state 는 대상 운영자의 `GET /api/admin/console/registry` 응답에서 관측 (등록부가 read-side 권위; PATCH 는 fire-and-re-read).
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 400 | `INVALID_REQUEST` | body shape mismatch / `defaultAccountId` 형식 위반 (`me/profile` 와 동일 validation) |
+| 400 | `REASON_REQUIRED` | `X-Operator-Reason` 누락 또는 빈 문자열 |
+| 400 | `SELF_PROFILE_UPDATE_FORBIDDEN_VIA_ADMIN_PATH` | `{operatorId}` 가 caller 본인의 `operator_id` 와 일치. self-serve 는 반드시 `/me/profile` (BE-306) 사용 (audit reason 포맷이 다름: self-flow `<self_profile_update>` 상수 vs caller-typed reason) |
+| 401 | `TOKEN_INVALID` | operator JWT 없음 / 만료 / 변조 / soft-delete 됨 |
+| 403 | `PERMISSION_DENIED` | caller 가 `operator.manage` 권한 미보유 |
+| 403 | `TENANT_SCOPE_DENIED` | 대상 operator 의 tenant 가 caller 의 scope 외 (caller `tenant='*'` 아니면 cross-tenant 차단) |
+| 404 | `OPERATOR_NOT_FOUND` | `operatorId` 미존재 |
+| 409 | `OPTIMISTIC_LOCK_CONFLICT` | `admin_operators.version` race |
+
+**Side Effects**
+
+- `admin_operators.finance_default_account_id` UPDATE — 단일 transaction (target operator 의 row)
+- `admin_actions` row INSERT (동일 transaction) — `action_code = "OPERATOR_PROFILE_UPDATE"` (BE-306 와 **공통 enum 재사용**; actor differentiation = `(operator_id, target_id)` tuple), `operator_id = caller.internalId`, `target_type = "OPERATOR"`, `target_id = target.operator_id` (대상 operator 의 public UUID — caller 와 다름), `permission_used = "operator.manage"`, `outcome = "SUCCESS"`, `reason = <X-Operator-Reason header value>` (caller-typed; self-flow `<self_profile_update>` 상수와 형식 구분됨), `detail IS NULL` (new value 자체는 audit `detail` 에 기록하지 않음 — registry GET 가 audit evidence). 두 write 중 하나라도 실패 시 transaction 전체 rollback (audit-heavy A3 invariant)
+- Refresh token 무효화 **없음** (status change 와 달리; profile mutation 은 인증 토큰 영향 없음)
+
+---
+
+## PATCH /api/admin/operators/me/password
+
+운영자 자신의 비밀번호를 변경한다.
+
+**Auth**: Operator JWT (유효한 토큰만 필요, 별도 permission 없음)
+
+**Request**
+
+```
+PATCH /api/admin/operators/me/password
+Content-Type: application/json
+```
+
+```json
+{
+  "currentPassword": "OldPass1!",
+  "newPassword":     "NewPass2@"
+}
+```
+
+| 필드 | 타입 | 필수 | 설명 |
+|---|---|---|---|
+| `currentPassword` | string | ✅ | 현재 비밀번호 (평문) |
+| `newPassword` | string | ✅ | 새 비밀번호 (평문). 8자 이상, 4종 문자(대·소·숫·특) 중 3종 이상 |
+
+**Response**
+
+`204 No Content` — 변경 성공, 본문 없음.
+
+**Errors**
+
+| HTTP | code | 설명 |
+|---|---|---|
+| 400 | `CURRENT_PASSWORD_MISMATCH` | 현재 비밀번호 불일치 |
+| 400 | `PASSWORD_POLICY_VIOLATION` | 새 비밀번호가 정책 미충족 |
+| 401 | `TOKEN_INVALID` | JWT 없음 또는 만료 |
+
+---
+
+## PATCH /api/admin/operators/me/profile
+
+운영자 자신의 프로파일 carrier (`operatorContext`) 를 변경한다. v1 은 **`finance_default_account_id` 단일 필드**만 수용한다 — Platform Console `Operator Overview` 의 finance 카드 기본 조회 계정 자가 설정 (TASK-BE-304 § Goal). 자가-프로비저닝 self-serve 경로로, `me/password` 와 형제 (자기 자신만 변경 가능, 다른 operator 의 프로파일 수정은 v1 범위 외).
+
+**Auth**: Operator JWT (유효한 토큰만 필요, 별도 permission 없음)
+**X-Operator-Reason**: 요구하지 않음 (§ Authentication > X-Operator-Reason in Exceptions sub-tree 의 self-flow 면제 적용; audit row 는 `<self_profile_update>` 상수로 기록)
+
+**Request**
+
+```
+PATCH /api/admin/operators/me/profile
+Content-Type: application/json
+```
+
+```json
+{
+  "operatorContext": {
+    "defaultAccountId": "acc-uuid-7"
+  }
+}
+```
+
+값을 **clear** 하려면 `defaultAccountId` 에 `null` 을 명시:
+
+```json
+{
+  "operatorContext": {
+    "defaultAccountId": null
+  }
+}
+```
+
+| 필드 | 타입 | 필수 | 설명 |
+|---|---|---|---|
+| `operatorContext` | object | ✅ | 프로파일 attribute carrier. v1 은 `defaultAccountId` 단일 키만 수용 (그 외 키 → 400 `INVALID_REQUEST`, `FAIL_ON_UNKNOWN_PROPERTIES`). 본 키 자체가 누락된 빈 body (`{}`) 또는 빈 객체 (`{"operatorContext":{}}`) → 400 |
+| `operatorContext.defaultAccountId` | string \| null | ✅ | finance-platform 계정 UUID (`VARCHAR(36)`, opaque — GAP 는 finance 에 verify 하지 않음, TASK-BE-304 § Decision authority). `null` = clear. 빈 문자열 / whitespace-only / 36자 초과 / 내부 공백·control char → 400 `INVALID_REQUEST` (clear 의도는 반드시 `null` 명시) |
+
+> **Request 와 Response 의 carrier 대칭성**: 본 PATCH 의 request body 는 `GET /api/admin/console/registry` 응답의 finance product item 에 나오는 `operatorContext: { defaultAccountId?: string }` 와 **동일한 shape** 이다 ([console-registry-api.md § Item shape](./console-registry-api.md)). UI 는 동일 JSON path 로 read → mutate → re-read 한다.
+
+**Response**
+
+`204 No Content` — 변경 성공, 본문 없음. 변경된 effective state 는 `GET /api/admin/console/registry` 로 재조회한다 (등록부가 read-side 권위; PATCH 는 fire-and-re-read).
+
+**Errors**
+
+| HTTP | code | 설명 |
+|---|---|---|
+| 400 | `INVALID_REQUEST` | body shape mismatch (`operatorContext` 키 누락, 빈 객체, 알 수 없는 nested key) / `defaultAccountId` 가 빈 문자열, whitespace-only, 36 자 초과, 내부 control char 포함 |
+| 401 | `TOKEN_INVALID` | JWT 없음 / 만료 / `OperatorAuthenticationFilter` 거부 / operator row soft-delete 됨 |
+| 409 | `OPTIMISTIC_LOCK_CONFLICT` | `admin_operators.version` race (두 브라우저 탭 동시 PATCH). 재시도 권장 |
+
+**Side effects**
+
+- `admin_operators.finance_default_account_id` UPDATE — 단일 transaction
+- `admin_actions` row INSERT (동일 transaction) — `action_code = "OPERATOR_PROFILE_UPDATE"`, `operator_id = self`, `target_type = "OPERATOR"`, `target_id = self.operator_id`, `permission_used = "<self_action>"`, `outcome = "SUCCESS"`, `detail IS NULL` (new value 자체는 audit `detail` 에 기록하지 않음 — registry GET 가 audit evidence). 두 write 중 하나라도 실패 시 transaction 전체 rollback (audit-heavy A3 invariant)
+
+---
+
+## Tenant Lifecycle (TASK-BE-256)
+
+`POST /api/admin/tenants` 등 4개 엔드포인트는 SUPER_ADMIN(`tenant_id='*'`) 만 호출할 수 있다. 일반 운영자는 `403 TENANT_SCOPE_DENIED`. 모든 mutating 엔드포인트는 [admin-events.md](../events/admin-events.md) 의 `admin.action.performed` 이벤트와 함께 [tenant-events.md](../events/tenant-events.md) 의 lifecycle 이벤트를 outbox 패턴으로 발행한다.
+
+### Tenant ID 규칙
+
+- 정규식: `^[a-z][a-z0-9-]{1,31}$` ([multi-tenancy.md](../../features/multi-tenancy.md#tenantid)).
+- **예약어** (생성 거부, `400 TENANT_ID_RESERVED`):
+  `admin`, `internal`, `system`, `null`, `default`, `public`, `gap`, `auth`, `oauth`, `me`.
+- 한 번 발급된 `tenant_id` 는 변경·재할당 불가 (감사 트레일·외부 토큰 정합).
+
+### Status 전이 매트릭스
+
+| 현재 상태 | → ACTIVE (PATCH `status=ACTIVE`) | → SUSPENDED (PATCH `status=SUSPENDED`) |
+|---|---|---|
+| (none) | `POST` 로 생성 (status=ACTIVE 만 허용) | `POST` 로 직접 SUSPENDED 생성 불가 |
+| ACTIVE | no-op (200, `tenant.updated` 미발행) | reactivate-able 전이; `tenant.suspended` 발행 |
+| SUSPENDED | reactivate; `tenant.reactivated` 발행 | no-op (200, 이벤트 미발행) |
+
+SUSPENDED 테넌트는 신규 로그인·신규 사용자 등록이 차단된다 (account-service consumer 가 `tenant.suspended` 이벤트 수신 시 차단 게이트 활성화 — TASK-BE-250 implementation 의 책임).
+
+### POST /api/admin/tenants
+
+신규 테넌트 등록.
+
+**Auth required**: 운영자 JWT, role = `SUPER_ADMIN`
+
+**Request**:
+```json
+{
+  "tenantId": "wms",
+  "displayName": "Warehouse Management System",
+  "tenantType": "B2B_ENTERPRISE"
+}
+```
+
+| 필드 | 타입 | 필수 | 검증 |
+|---|---|---|---|
+| `tenantId` | string | Y | 정규식 + 예약어 미포함 |
+| `displayName` | string | Y | 1~100자, trim 후 검증 |
+| `tenantType` | enum | Y | `B2C_CONSUMER` \| `B2B_ENTERPRISE` |
+
+`Idempotency-Key` 헤더는 권장. 동일 키로 재요청 시 첫 요청과 동일한 응답 반환 (이벤트 중복 발행 방지).
+
+**Response 201**:
+```json
+{
+  "tenantId": "wms",
+  "displayName": "Warehouse Management System",
+  "tenantType": "B2B_ENTERPRISE",
+  "status": "ACTIVE",
+  "createdAt": "2026-05-02T09:00:00Z",
+  "updatedAt": "2026-05-02T09:00:00Z"
+}
+```
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 400 | `VALIDATION_ERROR` | `tenantId` 정규식 위반, `displayName` 길이, `tenantType` enum 미일치 |
+| 400 | `TENANT_ID_RESERVED` | `tenantId` 가 예약어 목록에 포함 |
+| 401 | `TOKEN_INVALID` | — |
+| 403 | `PERMISSION_DENIED` | `tenant.manage` 권한 없음 |
+| 403 | `TENANT_SCOPE_DENIED` | 비-SUPER_ADMIN 운영자 호출 |
+| 409 | `TENANT_ALREADY_EXISTS` | 동일 `tenantId` 가 이미 존재 |
+| 503 | `INTEGRATION_UNAVAILABLE` | account-service 호출 CB open |
+
+**Side Effects**:
+- `admin_actions` 에 `action_code=TENANT_CREATE`, `tenant_id='*'` (actor), `target_tenant_id=<신규>`, `target_type='TENANT'`, `target_id=<신규 tenantId>`.
+- Outbox 이벤트 `tenant.created` 발행 ([tenant-events.md](../events/tenant-events.md)).
+
+---
+
+### GET /api/admin/tenants
+
+테넌트 목록 조회.
+
+**Auth required**: 운영자 JWT, role = `SUPER_ADMIN`
+
+**Query parameters**:
+
+| 파라미터 | 타입 | 기본값 | 설명 |
+|---|---|---|---|
+| `status` | enum (optional) | — | `ACTIVE` \| `SUSPENDED` 필터 |
+| `tenantType` | enum (optional) | — | `B2C_CONSUMER` \| `B2B_ENTERPRISE` 필터 |
+| `page` | int | 0 | — |
+| `size` | int | 20 (max 100) | — |
+
+**Response 200**:
+```json
+{
+  "items": [
+    {
+      "tenantId": "fan-platform",
+      "displayName": "Fan Platform",
+      "tenantType": "B2C_CONSUMER",
+      "status": "ACTIVE",
+      "createdAt": "2026-04-01T00:00:00Z",
+      "updatedAt": "2026-04-01T00:00:00Z"
+    }
+  ],
+  "page": 0,
+  "size": 20,
+  "totalElements": 1,
+  "totalPages": 1
+}
+```
+
+**Errors**: `401`, `403 PERMISSION_DENIED`, `403 TENANT_SCOPE_DENIED`, `422 VALIDATION_ERROR` (size > 100 등).
+
+---
+
+### GET /api/admin/tenants/{tenantId}
+
+단건 조회.
+
+**Auth required**: 운영자 JWT, role = `SUPER_ADMIN` 또는 `tenant.read` 권한 + `tenantId` == operator 의 `tenant_id` (자기 테넌트는 본인이 조회 가능).
+
+**Response 200**: POST 응답과 동일 schema.
+
+**Errors**: `401`, `403 PERMISSION_DENIED`, `403 TENANT_SCOPE_DENIED`, `404 TENANT_NOT_FOUND`.
+
+---
+
+### PATCH /api/admin/tenants/{tenantId}
+
+`displayName` 또는 `status` 변경. 두 필드 모두 optional 이며 최소 1개는 필요.
+
+**Auth required**: 운영자 JWT, role = `SUPER_ADMIN`
+
+**Request** (둘 중 하나 또는 둘 다):
+```json
+{
+  "displayName": "Warehouse Management System v2",
+  "status": "SUSPENDED"
+}
+```
+
+| 필드 | 타입 | 필수 | 검증 |
+|---|---|---|---|
+| `displayName` | string (optional) | — | 1~100자 |
+| `status` | enum (optional) | — | `ACTIVE` \| `SUSPENDED` (status 전이 매트릭스 참조) |
+
+**Response 200**: POST 응답과 동일 schema (변경 후 상태).
+
+**Errors**:
+
+| Status | Code | 조건 |
+|---|---|---|
+| 400 | `VALIDATION_ERROR` | 두 필드 모두 누락, displayName 길이 위반, status enum 미일치 |
+| 401 | `TOKEN_INVALID` | — |
+| 403 | `PERMISSION_DENIED` | `tenant.manage` 권한 없음 |
+| 403 | `TENANT_SCOPE_DENIED` | 비-SUPER_ADMIN 호출 |
+| 404 | `TENANT_NOT_FOUND` | `tenantId` 미존재 |
+| 503 | `INTEGRATION_UNAVAILABLE` | account-service CB open |
+
+**Side Effects** (변경 종류별):
+- `displayName` 변경 시 → `admin_actions: action_code=TENANT_UPDATE` + outbox `tenant.updated`.
+- `status: ACTIVE → SUSPENDED` → `admin_actions: action_code=TENANT_SUSPEND` + outbox `tenant.suspended`.
+- `status: SUSPENDED → ACTIVE` → `admin_actions: action_code=TENANT_REACTIVATE` + outbox `tenant.reactivated`.
+- 동일 status 로의 PATCH 는 no-op (200 반환, audit/event 미발행).
+
+---
+
+## Common Error Format
+
+```json
+{
+  "code": "UPPER_SNAKE_CASE",
+  "message": "Human-readable (no PII)",
+  "timestamp": "2026-04-12T10:00:00Z"
+}
+```
