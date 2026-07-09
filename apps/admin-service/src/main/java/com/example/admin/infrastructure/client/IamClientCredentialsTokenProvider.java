@@ -16,9 +16,10 @@ import java.util.Base64;
  * Obtains and caches a GAP {@code client_credentials} access token (JWT) for authenticating
  * admin-service's outbound {@code /internal/**} calls with {@code Authorization: Bearer}
  * (TASK-BE-318b, ADR-005 단계 3b). Used by {@code AccountServiceClient},
- * {@code AccountServiceTenantClient} (→ account) and {@code SecurityServiceClient} (→ security).
- * {@code AuthServiceClient} (→ auth) intentionally keeps the static {@code X-Internal-Token}
- * (auth receiver is still {@code permitAll}).
+ * {@code AccountServiceTenantClient} (→ account), {@code SecurityServiceClient} (→ security) and —
+ * since TASK-BE-487 (ADR-005 단계 4) — {@code AuthServiceClient} (→ auth), now that auth-service's
+ * {@code /internal/auth/**} receiver requires a GAP client_credentials JWT (its {@code permitAll} and
+ * the static {@code X-Internal-Token} path were removed).
  *
  * <p>Hand-rolled rather than {@code spring-boot-starter-oauth2-client} on purpose: that starter
  * pulls in {@code spring-security-web} client autoconfiguration; admin-service already runs its own
