@@ -1,4 +1,4 @@
-rootProject.name = 'monorepo-lab'
+rootProject.name = 'iam-platform'
 
 // Shared libraries (at repo root)
 //
@@ -84,11 +84,11 @@ include(
 
 // Project: iam-platform (renamed from global-account-platform / alias gap — TASK-MONO-179)
 include(
-    'projects:iam-platform:apps:account-service',
-    'projects:iam-platform:apps:admin-service',
-    'projects:iam-platform:apps:auth-service',
-    'projects:iam-platform:apps:gateway-service',
-    'projects:iam-platform:apps:security-service',
+    'apps:account-service',
+    'apps:admin-service',
+    'apps:auth-service',
+    'apps:gateway-service',
+    'apps:security-service',
     // TASK-MONO-394: community-service / membership-service RETIRED 2026-07-14.
     // They were iam's FROZEN product-layer demo consumers — a portfolio example
     // of "something calls account-service's internal API". fan-platform now does
@@ -108,7 +108,7 @@ include(
     // (TASK-MONO-078) 가 본 모듈의 build.gradle 을 갱신했으나 settings.gradle
     // include 가 없어 gradle 이 인식 못 했고 nightly iam-e2e-full job 의 첫
     // 호출에서 fail 했음. fan/scm 패턴 답습.
-    'projects:iam-platform:tests:e2e'
+    'tests:e2e'
 )
 
 // Project: fan-platform

@@ -80,8 +80,6 @@ name: Nightly E2E (full-stack web-store + 5 backend full suites + cross-project 
 #      모집단은 자기 `needs` 이고, 그것이 선언된 잡 수와 어긋나면 스스로 빨개진다.
 
 on:
-  schedule:
-    - cron: '0 18 * * *'  # UTC 18:00 = KST 03:00
   push:
     branches: [main]
   workflow_dispatch:
@@ -501,7 +499,7 @@ jobs:
 
       - name: Build IAM auth-service bootJar
         working-directory: ${{ github.workspace }}
-        run: ./gradlew :projects:iam-platform:apps:auth-service:bootJar --no-daemon
+        run: ./gradlew :apps:auth-service:bootJar --no-daemon
 
       - name: Issuer hostname resolves on the host (browser + Next.js server)
         # The OIDC issuer is spelled `http://auth-service:8081` from INSIDE docker
@@ -766,11 +764,11 @@ jobs:
         uses: ./.github/actions/setup-java-gradle
 
       # Build the GAP auth-service bootJar (the iam-e2e Dockerfile COPYs it).
-      # The monorepo has a single root gradlew (no projects/iam-platform/gradlew),
+      # The monorepo has a single root gradlew (no gradlew),
       # so run from the workspace root with the fully-qualified path.
       - name: Build auth-service bootJar
         working-directory: ${{ github.workspace }}
-        run: ./gradlew :projects:iam-platform:apps:auth-service:bootJar --no-daemon
+        run: ./gradlew :apps:auth-service:bootJar --no-daemon
 
       - name: Issuer hostname resolves on the host (browser + Next.js server)
         # PC-FE-028: both the browser AND the Next.js server must resolve the
@@ -944,7 +942,7 @@ jobs:
         :projects:fan-platform:apps:community-service:bootJar
         :projects:fan-platform:apps:artist-service:bootJar
         :projects:fan-platform:apps:membership-service:bootJar
-        :projects:iam-platform:apps:auth-service:bootJar
+        :apps:auth-service:bootJar
       timeout-minutes: 60
       gradle-target: ':projects:fan-platform:tests:e2e:e2eFullTest'
       services: >-
@@ -954,9 +952,9 @@ jobs:
           {"name":"artist-service","image":"fan-platform-artist-service:e2e","prop":"fan.e2e.artistImage"},
           {"name":"membership-service","image":"fan-platform-membership-service:e2e","prop":"fan.e2e.membershipImage"},
           {"name":"auth-service","image":"iam-auth-service:e2e","prop":"fan.e2e.iamImage",
-           "dir":"projects/iam-platform/apps/auth-service",
-           "context":"projects/iam-platform/",
-           "bootjar":":projects:iam-platform:apps:auth-service:bootJar"}
+           "dir":"apps/auth-service",
+           "context":"",
+           "bootjar":":apps:auth-service:bootJar"}
         ]
       report-artifact: fan-platform-e2e-full-test-reports-nightly
       report-paths: |
@@ -1019,11 +1017,11 @@ jobs:
         # ADR-MONO-011 § D5 audit (option C-1).
         run: >-
           ./gradlew
-          :projects:iam-platform:apps:auth-service:bootJar
-          :projects:iam-platform:apps:account-service:bootJar
-          :projects:iam-platform:apps:security-service:bootJar
-          :projects:iam-platform:apps:admin-service:bootJar
-          :projects:iam-platform:apps:gateway-service:bootJar
+          :apps:auth-service:bootJar
+          :apps:account-service:bootJar
+          :apps:security-service:bootJar
+          :apps:admin-service:bootJar
+          :apps:gateway-service:bootJar
           --no-daemon --stacktrace
 
       - name: Verify Docker (ComposeFixture prerequisite)
@@ -1039,7 +1037,7 @@ jobs:
         id: gradle
         run: >-
           ./gradlew
-          :projects:iam-platform:tests:e2e:e2eFullTest
+          :tests:e2e:e2eFullTest
           --no-daemon --stacktrace
 
       # TASK-MONO-545 — see `.github/actions/summarise-test-results`. `e2eFullTest`
@@ -1050,7 +1048,7 @@ jobs:
         uses: ./.github/actions/summarise-test-results
         with:
           lane: iam-e2e-full
-          gradle-tasks: ':projects:iam-platform:tests:e2e:e2eFullTest'
+          gradle-tasks: ':tests:e2e:e2eFullTest'
           run-outcome: ${{ steps.gradle.outcome }}
 
       - name: Upload iam e2e full test reports on failure
@@ -1059,8 +1057,8 @@ jobs:
         with:
           name: iam-e2e-full-test-reports-nightly
           path: |
-            projects/iam-platform/tests/e2e/build/reports/tests/e2eFullTest/
-            projects/iam-platform/tests/e2e/build/test-results/e2eFullTest/
+            tests/e2e/build/reports/tests/e2eFullTest/
+            tests/e2e/build/test-results/e2eFullTest/
           retention-days: 7
 
   ecommerce-fulfillment-e2e-full:
@@ -1190,9 +1188,9 @@ jobs:
         # console-web is a Next.js standalone build (handled in the e2e job).
         run: >-
           ./gradlew
-          :projects:iam-platform:apps:auth-service:bootJar
-          :projects:iam-platform:apps:account-service:bootJar
-          :projects:iam-platform:apps:admin-service:bootJar
+          :apps:auth-service:bootJar
+          :apps:account-service:bootJar
+          :apps:admin-service:bootJar
           :projects:finance-platform:apps:account-service:bootJar
           --no-daemon --stacktrace
 
@@ -1203,9 +1201,9 @@ jobs:
           # upload-artifact@v4 strips the longest common prefix; the
           # download step restores canonical paths.
           path: |
-            projects/iam-platform/apps/auth-service/build/libs/auth-service.jar
-            projects/iam-platform/apps/account-service/build/libs/account-service.jar
-            projects/iam-platform/apps/admin-service/build/libs/admin-service.jar
+            apps/auth-service/build/libs/auth-service.jar
+            apps/account-service/build/libs/account-service.jar
+            apps/admin-service/build/libs/admin-service.jar
             projects/finance-platform/apps/account-service/build/libs/account-service.jar
           retention-days: 1
 
@@ -1253,16 +1251,16 @@ jobs:
         # platform-console nightly job from 2026-06-06. Use the full dir name.
         working-directory: ${{ github.workspace }}
         run: |
-          mkdir -p projects/iam-platform/apps/auth-service/build/libs/
-          mkdir -p projects/iam-platform/apps/account-service/build/libs/
-          mkdir -p projects/iam-platform/apps/admin-service/build/libs/
+          mkdir -p apps/auth-service/build/libs/
+          mkdir -p apps/account-service/build/libs/
+          mkdir -p apps/admin-service/build/libs/
           mkdir -p projects/finance-platform/apps/account-service/build/libs/
           mv projects/platform-console/artifact-staging/iam-platform/apps/auth-service/build/libs/auth-service.jar \
-             projects/iam-platform/apps/auth-service/build/libs/auth-service.jar
+             apps/auth-service/build/libs/auth-service.jar
           mv projects/platform-console/artifact-staging/iam-platform/apps/account-service/build/libs/account-service.jar \
-             projects/iam-platform/apps/account-service/build/libs/account-service.jar
+             apps/account-service/build/libs/account-service.jar
           mv projects/platform-console/artifact-staging/iam-platform/apps/admin-service/build/libs/admin-service.jar \
-             projects/iam-platform/apps/admin-service/build/libs/admin-service.jar
+             apps/admin-service/build/libs/admin-service.jar
           mv projects/platform-console/artifact-staging/finance-platform/apps/account-service/build/libs/account-service.jar \
              projects/finance-platform/apps/account-service/build/libs/account-service.jar
 

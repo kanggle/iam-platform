@@ -109,7 +109,7 @@ dependencyManagement {
 // 5 cases. Declaring the files as inputs makes the sibling edit invalidate the task.
 //
 // 🔴 Former residual gap, now CLOSED: ci.yml's `iam` path filter used to be
-// `projects/iam-platform/**` only, so a PR touching ONLY infra/demo/seed/seed-fan.sh
+// `**` only, so a PR touching ONLY infra/demo/seed/seed-fan.sh
 // never woke this lane — no Gradle input alone can fix that, only the CI filter can.
 //
 // History, kept because "this gap was unowned" was itself a fact worth recording. The
@@ -125,7 +125,7 @@ dependencyManagement {
 //   gap cannot silently reopen. The identical wms gap (inbound-service reads
 //   infra/demo/seed/seed-scm.sh) closed in the same ticket.
 tasks.named('test') {
-    inputs.file(rootProject.file('projects/iam-platform/apps/account-service/src/main/resources/db/migration-dev/R__06_seed_fan_artist_accounts_and_artist_role.sql'))
+    inputs.file(rootProject.file('apps/account-service/src/main/resources/db/migration-dev/R__06_seed_fan_artist_accounts_and_artist_role.sql'))
             .withPropertyName('fanArtistAccountSeed')
             .withPathSensitivity(PathSensitivity.RELATIVE)
     inputs.file(rootProject.file('infra/demo/seed/seed-fan.sh'))
@@ -135,41 +135,41 @@ tasks.named('test') {
     // admin_operators.oidc_subject against this module's iam-tenant credential and had
     // the same blind spot. Same defect, same line — fixing one and leaving the other is
     // how the next person concludes the mechanism does not work.
-    inputs.file(rootProject.file('projects/iam-platform/apps/admin-service/src/main/resources/db/migration-dev/R__seed_demo_operator.sql'))
+    inputs.file(rootProject.file('apps/admin-service/src/main/resources/db/migration-dev/R__seed_demo_operator.sql'))
             .withPropertyName('demoOperatorSeed')
             .withPathSensitivity(PathSensitivity.RELATIVE)
     // TASK-BE-597: DemoViewerOperatorSeedTest pins the restricted operator's link key and
     // its "no role / no assignment" shape against this sibling file — same blind spot.
-    inputs.file(rootProject.file('projects/iam-platform/apps/admin-service/src/main/resources/db/migration-dev/R__seed_demo_viewer_operator.sql'))
+    inputs.file(rootProject.file('apps/admin-service/src/main/resources/db/migration-dev/R__seed_demo_viewer_operator.sql'))
             .withPropertyName('demoViewerOperatorSeed')
             .withPathSensitivity(PathSensitivity.RELATIVE)
     // TASK-MONO-751: DemoPlatformOperatorSeedTest pins the platform operator's link key, its
     // '*' home tenant and its "no role / no assignment" shape against this sibling file.
-    inputs.file(rootProject.file('projects/iam-platform/apps/admin-service/src/main/resources/db/migration-dev/R__seed_demo_platform_operator.sql'))
+    inputs.file(rootProject.file('apps/admin-service/src/main/resources/db/migration-dev/R__seed_demo_platform_operator.sql'))
             .withPropertyName('demoPlatformOperatorSeed')
             .withPathSensitivity(PathSensitivity.RELATIVE)
     // TASK-MONO-744: DemoSeedCredentialTest now pins the consumer-pool credential's
     // account_id against account-service R__05's pool account and its two site
     // memberships — same blind spot, same remedy.
-    inputs.file(rootProject.file('projects/iam-platform/apps/account-service/src/main/resources/db/migration-dev/R__05_seed_demo_corp_tenant_and_consumer_accounts.sql'))
+    inputs.file(rootProject.file('apps/account-service/src/main/resources/db/migration-dev/R__05_seed_demo_corp_tenant_and_consumer_accounts.sql'))
             .withPropertyName('demoConsumerAccountSeed')
             .withPathSensitivity(PathSensitivity.RELATIVE)
     // TASK-MONO-781: DemoCsOperatorSeedTest pins the CS operator's link key, home tenant,
     // SUPPORT_LOCK@ecommerce grant and confinement against this sibling file, and
     // DemoCsOperatorDerivedRolesTest recomputes its disclosed domain roles from it plus EVERY
     // account-service migration that writes tenant_domain_subscription — same blind spot.
-    inputs.file(rootProject.file('projects/iam-platform/apps/admin-service/src/main/resources/db/migration-dev/R__seed_demo_cs_operator.sql'))
+    inputs.file(rootProject.file('apps/admin-service/src/main/resources/db/migration-dev/R__seed_demo_cs_operator.sql'))
             .withPropertyName('demoCsOperatorSeed')
             .withPathSensitivity(PathSensitivity.RELATIVE)
     // TASK-BE-632: DemoCsOperatorDerivedRolesTest#csHoldsLegacyCompat reads the domain-set demo seed —
     // since P3 the CS operator's roles are its ASSIGNED sets ∩ the derivation, so the seed is an input.
-    inputs.file(rootProject.file('projects/iam-platform/apps/admin-service/src/main/resources/db/migration-dev/R__seed_zz_demo_domain_permission_sets.sql'))
+    inputs.file(rootProject.file('apps/admin-service/src/main/resources/db/migration-dev/R__seed_zz_demo_domain_permission_sets.sql'))
             .withPropertyName('demoDomainSetSeed')
             .withPathSensitivity(PathSensitivity.RELATIVE)
-    inputs.dir(rootProject.file('projects/iam-platform/apps/account-service/src/main/resources/db/migration'))
+    inputs.dir(rootProject.file('apps/account-service/src/main/resources/db/migration'))
             .withPropertyName('accountServiceProdMigrationsForDemoRoles')
             .withPathSensitivity(PathSensitivity.RELATIVE)
-    inputs.dir(rootProject.file('projects/iam-platform/apps/account-service/src/main/resources/db/migration-dev'))
+    inputs.dir(rootProject.file('apps/account-service/src/main/resources/db/migration-dev'))
             .withPropertyName('accountServiceDevMigrationsForDemoRoles')
             .withPathSensitivity(PathSensitivity.RELATIVE)
 }
@@ -186,16 +186,16 @@ tasks.named('test') {
 // `tasks.matching` rather than `tasks.named` — `integrationTest` is registered by the parent
 // project's `subprojects {}` block, so this file must not depend on evaluation order.
 tasks.matching { it.name == 'integrationTest' }.configureEach {
-    inputs.dir(rootProject.file('projects/iam-platform/apps/account-service/src/main/resources/db/migration'))
+    inputs.dir(rootProject.file('apps/account-service/src/main/resources/db/migration'))
             .withPropertyName('accountServiceProdMigrations')
             .withPathSensitivity(PathSensitivity.RELATIVE)
-    inputs.dir(rootProject.file('projects/iam-platform/apps/account-service/src/main/resources/db/migration-dev'))
+    inputs.dir(rootProject.file('apps/account-service/src/main/resources/db/migration-dev'))
             .withPropertyName('accountServiceDevMigrations')
             .withPathSensitivity(PathSensitivity.RELATIVE)
-    inputs.file(rootProject.file('projects/iam-platform/apps/admin-service/src/main/java/com/example/admin/application/tenant/CreateTenantUseCase.java'))
+    inputs.file(rootProject.file('apps/admin-service/src/main/java/com/example/admin/application/tenant/CreateTenantUseCase.java'))
             .withPropertyName('reservedTenantSlugSource')
             .withPathSensitivity(PathSensitivity.RELATIVE)
-    inputs.file(rootProject.file('projects/iam-platform/specs/features/multi-tenancy.md'))
+    inputs.file(rootProject.file('specs/features/multi-tenancy.md'))
             .withPropertyName('multiTenancySpec')
             .withPathSensitivity(PathSensitivity.RELATIVE)
 }

@@ -31,8 +31,6 @@ name: Federation Hardening E2E (Phase 8 cross-product, nightly)
 # existing producer read endpoints (ADR-018 § 3.3 zero-retrofit sixth confirmation).
 
 on:
-  schedule:
-    - cron: '0 19 * * *'  # UTC 19:00 = KST 04:00 (1h after nightly-e2e.yml)
   workflow_dispatch:
 
 # Scoped to the monorepo (extracted portfolio repos have no backend stack).
@@ -82,9 +80,9 @@ jobs:
         # console-web is a Next.js standalone build (handled in e2e job).
         run: >-
           ./gradlew
-          :projects:iam-platform:apps:auth-service:bootJar
-          :projects:iam-platform:apps:account-service:bootJar
-          :projects:iam-platform:apps:admin-service:bootJar
+          :apps:auth-service:bootJar
+          :apps:account-service:bootJar
+          :apps:admin-service:bootJar
           :projects:finance-platform:apps:account-service:bootJar
           :projects:finance-platform:apps:ledger-service:bootJar
           :projects:wms-platform:apps:master-service:bootJar
@@ -105,9 +103,9 @@ jobs:
           # uploads — artifact root becomes <project>/apps/<service>/build/libs/<jar>.
           # The e2e job below restores canonical paths.
           path: |
-            projects/iam-platform/apps/auth-service/build/libs/auth-service.jar
-            projects/iam-platform/apps/account-service/build/libs/account-service.jar
-            projects/iam-platform/apps/admin-service/build/libs/admin-service.jar
+            apps/auth-service/build/libs/auth-service.jar
+            apps/account-service/build/libs/account-service.jar
+            apps/admin-service/build/libs/admin-service.jar
             projects/finance-platform/apps/account-service/build/libs/account-service.jar
             projects/finance-platform/apps/ledger-service/build/libs/ledger-service.jar
             projects/wms-platform/apps/master-service/build/libs/master-service.jar
@@ -161,9 +159,9 @@ jobs:
         # that each Dockerfile expects (COPY <service>/build/libs/*.jar app.jar).
         run: |
           # IAM services
-          mkdir -p projects/iam-platform/apps/auth-service/build/libs/
-          mkdir -p projects/iam-platform/apps/account-service/build/libs/
-          mkdir -p projects/iam-platform/apps/admin-service/build/libs/
+          mkdir -p apps/auth-service/build/libs/
+          mkdir -p apps/account-service/build/libs/
+          mkdir -p apps/admin-service/build/libs/
           # TASK-MONO-207: artifact root is the upload-artifact@v4 longest-common-
           # prefix-stripped path = `<project>/apps/...`, i.e. `iam-platform/` (NOT
           # `iam/`). The TASK-MONO-179 gap→iam rename (#1149) shortened these three
@@ -171,11 +169,11 @@ jobs:
           # `iam-platform/` — the mismatch made `mv` fail (exit 1) and broke the
           # whole nightly from 2026-06-06. Restore the full project dir name.
           mv artifact-staging/iam-platform/apps/auth-service/build/libs/auth-service.jar \
-             projects/iam-platform/apps/auth-service/build/libs/auth-service.jar
+             apps/auth-service/build/libs/auth-service.jar
           mv artifact-staging/iam-platform/apps/account-service/build/libs/account-service.jar \
-             projects/iam-platform/apps/account-service/build/libs/account-service.jar
+             apps/account-service/build/libs/account-service.jar
           mv artifact-staging/iam-platform/apps/admin-service/build/libs/admin-service.jar \
-             projects/iam-platform/apps/admin-service/build/libs/admin-service.jar
+             apps/admin-service/build/libs/admin-service.jar
 
           # finance-platform
           mkdir -p projects/finance-platform/apps/account-service/build/libs/

@@ -30,70 +30,108 @@ subprojects {
         testAnnotationProcessor 'org.projectlombok:lombok:1.18.36'
     }
 
-    // Default `test` task runs unit + slice tests only — Testcontainers-backed
-    // classes carry `@Tag("integration")` (either directly or via the
-    // `AbstractIntegrationTest` base in `libs/java-test-support`) and are
-    // excluded so the root CI `:check` stays Docker-free. The dedicated
-    // `:integrationTest` task below opts back in for environments that have
-    // Docker available (CI iam-integration-tests job, local developer runs).
     test {
-        useJUnitPlatform {
-            excludeTags 'integration'
-        }
+        useJUnitPlatform()
         jvmArgs '-XX:+EnableDynamicAgentLoading'
-
-        // Forward Testcontainers-relevant env/system props into the forked test JVM.
-        // On Windows + Docker Desktop, named-pipe auto-detection can fail; developers
-        // set DOCKER_HOST=tcp://localhost:2375 (requires the "Expose daemon on tcp"
-        // option). See docs/guides/local-integration-testing.md.
-        def dockerHost = System.getenv('DOCKER_HOST') ?: System.getProperty('docker.host')
-        if (dockerHost) {
-            environment 'DOCKER_HOST', dockerHost
-            systemProperty 'docker.host', dockerHost
-        }
     }
 
-    // Opt-in task for `@Tag("integration")` tests. Requires Docker.
-    // Runs the same source set as `test` (no separate compile / classpath) and
-    // raises the per-test timeout because Spring context boot + container
-    // startup can exceed the default.
-    tasks.register('integrationTest', Test) {
-        description = 'Runs only @Tag("integration") tests (Testcontainers required).'
-        group = 'verification'
-        useJUnitPlatform {
-            includeTags 'integration'
-        }
-        testClassesDirs = sourceSets.test.output.classesDirs
-        classpath = sourceSets.test.runtimeClasspath
-        jvmArgs '-XX:+EnableDynamicAgentLoading'
-        // TASK-MONO-771 S6: Gradle's forked test JVM defaults to a 512 MiB heap. The Spring
-        // context cache holds many contexts across ~195 tests, and admin-service's
-        // break-glass login runs an Argon2id verify at m=65536 KiB (64 MiB per call).
-        // Near the ceiling that one request either threw an Error (500, no stack trace)
-        // or GC-thrashed past the 5m timeout (TokenExchangeIntegrationTest BE-377).
-        maxHeapSize = '1536m'
-        systemProperty 'junit.jupiter.execution.timeout.default', '5m'
+    // Forward Docker / Testcontainers env into every Test task (test, integrationTest,
+    // e2eTest, etc.). docker-java's default API version (1.32) is rejected by modern
+    // dockerd implementations — Rancher Desktop's dockerd requires minimum API 1.41,
+    // and Docker Desktop 4.36+ has a CLI proxy that intercepts docker-java probes.
+    // DOCKER_API_VERSION + system property 'api.version' force docker-java to skip
+    // the stale default. DOCKER_HOST forwarding handles Windows named-pipe / WSL2
+    // socket override scenarios.
+    // Defensive future-proof — when `-Xlint:all` or `-Xlint:serial` is ever
+    // enabled (currently neither is set), silently skip the cosmetic `[serial]`
+    // warning category. This codebase uses exceptions only for control flow
+    // (Spring `@RestControllerAdvice` converts to JSON ErrorResponse before
+    // serialization), so the missing `serialVersionUID` warnings on ~200
+    // exception classes are pure noise. Per TASK-MONO-131.
+    tasks.withType(JavaCompile).configureEach {
+        options.compilerArgs.add('-Xlint:-serial')
+    }
 
-        testLogging {
-            events 'passed', 'failed', 'skipped'
-            exceptionFormat 'full'
-            showStandardStreams = true
-        }
-
+    tasks.withType(Test).configureEach {
         def dockerHost = System.getenv('DOCKER_HOST') ?: System.getProperty('docker.host')
         if (dockerHost) {
             environment 'DOCKER_HOST', dockerHost
             systemProperty 'docker.host', dockerHost
         }
-
-        // Surface System.out / System.err from inside tests in the CI log so
-        // that diagnostic prints (e.g. `[046-7][cluster-a]` body / stack traces)
-        // are visible without per-test slf4j adapter setup. Same pattern as
-        // scm-platform tests/e2e/build.gradle (TASK-SCM-INT-001).
-        testLogging {
-            events 'passed', 'failed', 'skipped'
-            exceptionFormat 'full'
-            showStandardStreams = true
-        }
+        def apiVersion = System.getenv('DOCKER_API_VERSION') ?: '1.45'
+        environment 'DOCKER_API_VERSION', apiVersion
+        systemProperty 'api.version', apiVersion
     }
 }
+
+// ---------------------------------------------------------------------------
+// ADR-MONO-049 § D2 / § D3 assertion V4 — NO `api` ON A SHARED LIBRARY. ANYWHERE.
+//
+// `implementation project(':libs:x')` keeps x's own dependencies off the consumer's compile
+// classpath. `api` re-exports them. That difference is the ONLY thing holding the
+// servlet/reactive isolation apart: libs:java-gateway declares libs:java-security with
+// `implementation`, so it does NOT transit — which is precisely why the six gateways each
+// declare java-security themselves (TASK-MONO-378, four new lines).
+//
+// The temptation this assertion exists to kill is exactly those four lines. Switching
+// java-gateway's dependency to `api` makes them unnecessary and the build green. It also
+// starts re-exporting whatever java-security transitively holds — today spring-security-oauth2-jose,
+// tomorrow whatever someone adds — into every consumer of java-gateway. ADR-MONO-048 § D1 banned
+// `api` on the gateway library for that reason, and A BAN THAT ACQUIRES AN EXCEPTION THE FIRST
+// TIME IT IS INCONVENIENT IS NOT A BAN.
+//
+// This inspects the resolved dependency graph, not the text of a build file: a rename, an
+// alias, or a `configurations.api.extendsFrom(...)` indirection cannot slip past it.
+// ---------------------------------------------------------------------------
+tasks.register('assertNoApiOnSharedLibs') {
+    group = 'verification'
+    description = 'ADR-MONO-049 § D2 — no module may re-export a libs:* project via `api`.'
+
+    def offenders = []
+    def inspected = 0
+    allprojects.each { p ->
+        def apiConf = p.configurations.findByName('api')
+        if (apiConf == null) {
+            return  // no java-library plugin here; `api` does not exist to be misused
+        }
+        inspected++
+        apiConf.dependencies.each { d ->
+            if (d instanceof ProjectDependency && d.dependencyProject.path.startsWith(':libs:')) {
+                offenders << "  ${p.path}  ->  api project('${d.dependencyProject.path}')"
+            }
+        }
+    }
+
+    doLast {
+        if (offenders) {
+            throw new GradleException(
+                    "A shared library is re-exported with `api`. That undoes the servlet/reactive " +
+                    "isolation the libs:* split exists for (ADR-MONO-048 § D1, ADR-MONO-049 § D2).\n\n" +
+                    offenders.join('\n') + "\n\n" +
+                    "  Use `implementation`, and let each consumer declare what it actually uses.\n" +
+                    "  If that means adding a dependency line to several consumers: add the lines. " +
+                    "That is the cost of the isolation, and it is the intended cost.")
+        }
+        logger.lifecycle("assertNoApiOnSharedLibs: OK — ${inspected} module(s) declare an `api` " +
+                "configuration, none of them re-export a libs:* project.")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REACHABILITY — including a correction of what this comment used to claim.
+//
+// It read: "The root `check` runs in CI's 'Build & Test (JDK 21, Linux)' job, so this
+// assertion is reachable on every code change." That was FALSE from the day it was
+// written, and TASK-MONO-527 measured it: the job invokes an explicit task list
+// (`./gradlew :libs:…:check :projects:…:check`) and never a bare root `:check`, so the
+// root project's own `check` was never in the task graph. The assertion had not run once.
+//
+// The sentence that comment cited — "a guard that does not run reports green"
+// (TASK-MONO-359 / TASK-MONO-360) — was describing itself.
+//
+// The wiring below STAYS: it is what puts the assertion into a developer's local
+// `./gradlew check`. CI reachability is a SEPARATE surface and comes from naming
+// `:assertNoApiOnSharedLibs` explicitly on that job's task list, which is where it now
+// is. Do not infer either surface from the other — that inference is the whole defect.
+// ---------------------------------------------------------------------------
+tasks.named('check') { dependsOn 'assertNoApiOnSharedLibs' }

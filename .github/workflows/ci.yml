@@ -51,7 +51,7 @@ jobs:
   #              → activates ALL downstream jobs (CI self-change safety)
   #   wms        projects/wms-platform/**
   #   ecommerce  projects/ecommerce-microservices-platform/**
-  #   iam        projects/iam-platform/**
+  #   iam        **
   #   fan        projects/fan-platform/**
   #   scm        projects/scm-platform/**
   #   contracts  projects/*/specs/contracts/**
@@ -497,7 +497,7 @@ jobs:
             # FanArtistDemoSeedTest. This gap was recorded as UNOWNED in this same
             # build.gradle file and in ADR-MONO-063:187 before this ticket closed it.
             iam:
-              - 'projects/iam-platform/**'
+              - '**'
               - 'infra/demo/seed/seed-fan.sh'
             fan:
               - 'projects/fan-platform/**'
@@ -643,7 +643,7 @@ jobs:
               - '**/*.md'
               - '**/*.html'
               - 'infra/demo/owner-operator.sh'
-              - 'projects/iam-platform/apps/admin-service/src/main/resources/db/migration-dev/R__seed_demo_star_owner_operator.sql'
+              - 'apps/admin-service/src/main/resources/db/migration-dev/R__seed_demo_star_owner_operator.sql'
             service-type-notation:
               - 'projects/*/specs/services/*/architecture.md'
               - 'platform/service-types/INDEX.md'
@@ -1067,7 +1067,7 @@ jobs:
             # and a row deleted from the contract.
             # Pure-positive (no negation — MONO-074/075 quirk rule).
             jwt-claims:
-              - 'projects/iam-platform/apps/auth-service/src/main/**/*.java'
+              - 'apps/auth-service/src/main/**/*.java'
               - 'platform/contracts/jwt-standard-claims.md'
               - 'scripts/check-jwt-claims-registry.sh'
             # TASK-MONO-372: the Service Type cell in specs/services/*/architecture.md
@@ -3038,12 +3038,12 @@ jobs:
         :projects:ecommerce-microservices-platform:apps:shipping-service:check
         :projects:ecommerce-microservices-platform:apps:user-service:check
       GRADLE_TASKS_IAM: >-
-        :projects:iam-platform:apps:auth-service:check
-        :projects:iam-platform:apps:account-service:check
-        :projects:iam-platform:apps:admin-service:check
-        :projects:iam-platform:apps:gateway-service:check
-        :projects:iam-platform:apps:security-service:check
-        :projects:iam-platform:tests:e2e:check
+        :apps:auth-service:check
+        :apps:account-service:check
+        :apps:admin-service:check
+        :apps:gateway-service:check
+        :apps:security-service:check
+        :tests:e2e:check
       GRADLE_TASKS_FAN: >-
         :projects:fan-platform:apps:gateway-service:check
         :projects:fan-platform:apps:community-service:check
@@ -3114,7 +3114,7 @@ jobs:
       - name: Build and check IAM backend (Docker-free)
         # IAM integration tests carry @Tag("integration") (either directly or
         # via AbstractIntegrationTest base) and are excluded from `:test` /
-        # `:check` by `projects/iam-platform/build.gradle`. They
+        # `:check` by `build.gradle`. They
         # run in the dedicated `iam-integration-tests` job below. This step
         # therefore stays Docker-free. The tests/e2e module's default `test`
         # carries `excludeTags 'e2e'` (fan/scm pattern, TASK-MONO-080) so its
@@ -3201,7 +3201,7 @@ jobs:
             ${{ env.GRADLE_TASKS_FAN }} ${{ env.GRADLE_TASKS_SCM }}
             ${{ env.GRADLE_TASKS_FINANCE }} ${{ env.GRADLE_TASKS_ERP }}
           allow-empty: >-
-            projects/iam-platform/tests/e2e
+            tests/e2e
             projects/fan-platform/tests/e2e
           run-outcome: >-
             ${{ (steps.gradle-core.outcome == 'success'
@@ -3367,7 +3367,7 @@ jobs:
           :projects:fan-platform:apps:community-service:bootJar
           :projects:fan-platform:apps:artist-service:bootJar
           :projects:fan-platform:apps:membership-service:bootJar
-          :projects:iam-platform:apps:auth-service:bootJar
+          :apps:auth-service:bootJar
           --no-daemon --stacktrace
 
       - name: Upload fan-platform boot jars
@@ -3395,7 +3395,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fan-platform-iam-boot-jar
-          path: projects/iam-platform/apps/auth-service/build/libs/auth-service.jar
+          path: apps/auth-service/build/libs/auth-service.jar
           retention-days: 1
 
   scm-platform-boot-jars:
@@ -3794,13 +3794,13 @@ jobs:
         include:
           - shard: A
             tasks: >-
-              :projects:iam-platform:apps:admin-service:integrationTest
-              :projects:iam-platform:apps:security-service:integrationTest
+              :apps:admin-service:integrationTest
+              :apps:security-service:integrationTest
           - shard: B
             tasks: >-
-              :projects:iam-platform:apps:auth-service:integrationTest
-              :projects:iam-platform:apps:account-service:integrationTest
-              :projects:iam-platform:apps:gateway-service:integrationTest
+              :apps:auth-service:integrationTest
+              :apps:account-service:integrationTest
+              :apps:gateway-service:integrationTest
     # IAM integration suite boots MySQL + Kafka + (per-service Redis/WireMock)
     # via Testcontainers. Scoped to monorepo-lab; the standalone repo
     # extraction relies on its own Docker-free `check` signal.
@@ -3839,8 +3839,8 @@ jobs:
       # UNMEASURED. Keeping it is the conservative default — not a finding.
       gradle-args: --no-parallel
       report-paths: |
-        projects/iam-platform/apps/*/build/reports/tests/integrationTest/
-        projects/iam-platform/apps/*/build/test-results/integrationTest/
+        apps/*/build/reports/tests/integrationTest/
+        apps/*/build/test-results/integrationTest/
 
   fan-integration-tests:
     name: Integration (fan-platform, Testcontainers)
@@ -3936,11 +3936,11 @@ jobs:
         # (TASK-MONO-081 + ADR-MONO-011 § D5 audit, option C-1).
         run: >-
           ./gradlew
-          :projects:iam-platform:apps:auth-service:bootJar
-          :projects:iam-platform:apps:account-service:bootJar
-          :projects:iam-platform:apps:security-service:bootJar
-          :projects:iam-platform:apps:admin-service:bootJar
-          :projects:iam-platform:apps:gateway-service:bootJar
+          :apps:auth-service:bootJar
+          :apps:account-service:bootJar
+          :apps:security-service:bootJar
+          :apps:admin-service:bootJar
+          :apps:gateway-service:bootJar
           --no-daemon --stacktrace
 
       - name: Verify Docker (ComposeFixture prerequisite)
@@ -3961,7 +3961,7 @@ jobs:
         id: gradle
         run: >-
           ./gradlew
-          :projects:iam-platform:tests:e2e:e2eSmokeTest
+          :tests:e2e:e2eSmokeTest
           --no-daemon --stacktrace
 
       # TASK-MONO-545. This job exists to prove ComposeFixture is exercised on every PR
@@ -3974,7 +3974,7 @@ jobs:
         uses: ./.github/actions/summarise-test-results
         with:
           lane: iam-e2e-smoke
-          gradle-tasks: ':projects:iam-platform:tests:e2e:e2eSmokeTest'
+          gradle-tasks: ':tests:e2e:e2eSmokeTest'
           run-outcome: ${{ steps.gradle.outcome }}
 
       - name: Upload iam e2e smoke test reports on failure
@@ -3983,8 +3983,8 @@ jobs:
         with:
           name: iam-platform-e2e-smoke-test-reports
           path: |
-            projects/iam-platform/tests/e2e/build/reports/tests/e2eSmokeTest/
-            projects/iam-platform/tests/e2e/build/test-results/e2eSmokeTest/
+            tests/e2e/build/reports/tests/e2eSmokeTest/
+            tests/e2e/build/test-results/e2eSmokeTest/
           retention-days: 7
 
   scm-integration-tests:
@@ -4353,10 +4353,10 @@ jobs:
           {"name":"artist-service","image":"fan-platform-artist-service:e2e","prop":"fan.e2e.artistImage"},
           {"name":"membership-service","image":"fan-platform-membership-service:e2e","prop":"fan.e2e.membershipImage"},
           {"name":"auth-service","image":"iam-auth-service:e2e","prop":"fan.e2e.iamImage",
-           "dir":"projects/iam-platform/apps/auth-service",
-           "context":"projects/iam-platform/",
+           "dir":"apps/auth-service",
+           "context":"",
            "jar":"artifact-staging-fan-iam/auth-service.jar",
-           "bootjar":":projects:iam-platform:apps:auth-service:bootJar"}
+           "bootjar":":apps:auth-service:bootJar"}
         ]
       report-artifact: fan-platform-e2e-test-reports
       report-paths: |
